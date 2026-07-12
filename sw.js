@@ -1,4 +1,4 @@
-const CACHE_NAME = "lifestyle-shell-v1";
+const CACHE_NAME = "lifestyle-shell-v2";
 const ASSETS = [
   "./",
   "./index.html",
@@ -24,6 +24,7 @@ self.addEventListener("activate", (e) => {
 
 self.addEventListener("fetch", (e) => {
   if (e.request.method !== "GET") return;
+  if (new URL(e.request.url).origin !== self.location.origin) return;
   e.respondWith(
     fetch(e.request)
       .then((res) => {
