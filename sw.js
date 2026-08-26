@@ -31,6 +31,12 @@ self.addEventListener("fetch", (e) => {
     e.respondWith((async () => {
       try {
         const form = await e.request.formData();
+        const text = (form.get("text") || "") + "";
+        if (text.trim()) {
+          const cache = await caches.open(SHARE_CACHE);
+          await cache.put("/__shared_text", new Response(text, { headers: { "Content-Type": "text/plain" } }));
+          return Response.redirect("./?shared=text", 303);
+        }
         const file = form.get("statement");
         if (file && file.size) {
           const cache = await caches.open(SHARE_CACHE);
