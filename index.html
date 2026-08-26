@@ -492,11 +492,13 @@ function TodayScreen({ habits, checks, toggleDFn, today, categories, setScreen, 
   return o.default.createElement("div", { style: { padding: "10px 16px 20px" } },
 
     // greeting
-    o.default.createElement("div", { style: { padding: "6px 2px 14px" } },
-      o.default.createElement("div", { style: { fontSize: "22px", fontWeight: "700", color: c.ink, letterSpacing: "-0.02em" } },
-        greet + (who ? ", " + String(who).split(" ")[0] : "")),
-      o.default.createElement("div", { style: { fontSize: "12.5px", color: c.inkFaint, marginTop: "3px" } },
-        w1[today.getDay()] + ", " + today.getDate() + " " + Mo[today.getMonth()])),
+    o.default.createElement("div", { style: { padding: "6px 2px 14px", display: "flex", alignItems: "center", gap: "10px" } },
+      o.default.createElement("div", { style: { flex: 1, minWidth: 0 } },
+        o.default.createElement("div", { style: { fontSize: "22px", fontWeight: "700", color: c.ink, letterSpacing: "-0.02em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+          greet + (who ? ", " + String(who).split(" ")[0] : "")),
+        o.default.createElement("div", { style: { fontSize: "12.5px", color: c.inkFaint, marginTop: "3px" } },
+          w1[today.getDay()] + ", " + today.getDate() + " " + Mo[today.getMonth()])),
+      o.default.createElement(HeaderAvatar, { onClick: function () { setModal({ type: "profile" }); } })),
 
     // mood
     o.default.createElement(TCard, { title: mood[dk] ? "How today felt · " + (moodFor(mood[dk].r) || {}).label : "How is today going?" },
@@ -2134,6 +2136,318 @@ function PersonSheet({ person, today, onClose, updatePerson, markContacted }) {
   );
 }
 
+// ---- cross-domain correlations ---------------------------------------------
+// These only work because habits, mood, tasks and money share one local store.
+
+function moodByHabit(habits, checks, today, minDays) {
+  var moods = lsGet(K_MOOD, {}) || {};
+  var keys = Object.keys(moods);
+  if (keys.length < (minDays || 8)) return [];
+  var rows = (habits.daily || []).map(function (h, i) { return { h: h, i: i }; }).filter(function (x) { return x.h && x.h.name; });
+  var out = [];
+  rows.forEach(function (x) {
+    var on = [], off = [];
+    keys.forEach(function (k) {
+      var m = moods[k]; if (!m || !m.r) return;
+      var v = ((checks.daily || {})[k] || {})[x.i];
+      if (v === "skip") return;
+      if (v) on.push(m.r); else off.push(m.r);
+    });
+    if (on.length < 3 || off.length < 3) return;
+    var a = on.reduce(function (p, q) { return p + q; }, 0) / on.length;
+    var b = off.reduce(function (p, q) { return p + q; }, 0) / off.length;
+    out.push({
+      habit: x.h, idx: x.i,
+      withIt: Math.round(a * 10) / 10, without: Math.round(b * 10) / 10,
+      diff: Math.round((a - b) * 10) / 10, nOn: on.length, nOff: off.length
+    });
+  });
+  return out.sort(function (p, q) { return Math.abs(q.diff) - Math.abs(p.diff); });
+}
+
+// Does hitting a habit in a month line up with spending less in a category?
+function habitVsSpend(habits, checks, today) {
+  var spends = allSpends();
+  if (!spends.length) return [];
+  var months = {};
+  spends.forEach(function (s) {
+    if (!s.month) return;
+    months[s.month] = months[s.month] || {};
+    months[s.month][s.category] = (months[s.month][s.category] || 0) + s.amount;
+  });
+  var mk = Object.keys(months).sort();
+  if (mk.length < 3) return [];
+
+  var rows = (habits.daily || []).map(function (h, i) { return { h: h, i: i }; }).filter(function (x) { return x.h && x.h.name; });
+  var cats = {};
+  mk.forEach(function (m) { Object.keys(months[m]).forEach(function (ct) { cats[ct] = 1; }); });
+
+  var out = [];
+  rows.forEach(function (x) {
+    // completion rate per month for this habit
+    var rate = {};
+    mk.forEach(function (m) {
+      var p = m.split("-"), yr = Number(p[0]), mo = Number(p[1]) - 1;
+      var days = To(yr, mo), done = 0, poss = 0;
+      for (var d = 1; d <= days; d++) {
+        var dt = new Date(yr, mo, d);
+        if (dt > today) break;
+        var v = ((checks.daily || {})[La(yr, mo, d)] || {})[x.i];
+        if (v === "skip") continue;
+        poss++; if (v) done++;
+      }
+      rate[m] = poss ? done / poss : null;
+    });
+    var usable = mk.filter(function (m) { return rate[m] !== null; });
+    if (usable.length < 3) return;
+    var avgRate = usable.reduce(function (a, m) { return a + rate[m]; }, 0) / usable.length;
+
+    Object.keys(cats).forEach(function (ct) {
+      var hi = [], lo = [];
+      usable.forEach(function (m) {
+        var amt = months[m][ct] || 0;
+        if (rate[m] >= avgRate) hi.push(amt); else lo.push(amt);
+      });
+      if (hi.length < 1 || lo.length < 1) return;
+      var a = hi.reduce(function (p, q) { return p + q; }, 0) / hi.length;
+      var b = lo.reduce(function (p, q) { return p + q; }, 0) / lo.length;
+      if (b < 500 && a < 500) return;
+      var pct = b ? Math.round((a - b) / b * 100) : null;
+      if (pct === null || Math.abs(pct) < 15) return;
+      out.push({ habit: x.h, category: ct, good: Math.round(a), bad: Math.round(b), pct: pct });
+    });
+  });
+  return out.sort(function (p, q) { return Math.abs(q.pct) - Math.abs(p.pct); }).slice(0, 4);
+}
+
+// how each habit's last 30 days compares with its 90-day baseline
+function habitTrends(habits, checks, today) {
+  var rows = (habits.daily || []).map(function (h, i) { return { h: h, i: i }; }).filter(function (x) { return x.h && x.h.name; });
+  var rateOver = function (idx, from, to) {
+    var done = 0, poss = 0;
+    for (var k = from; k < to; k++) {
+      var d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - k);
+      var v = ((checks.daily || {})[La(d.getFullYear(), d.getMonth(), d.getDate())] || {})[idx];
+      if (v === "skip") continue;
+      poss++; if (v) done++;
+    }
+    return poss ? done / poss : null;
+  };
+  return rows.map(function (x) {
+    var recent = rateOver(x.i, 0, 30), base = rateOver(x.i, 30, 120);
+    if (recent === null || base === null || base === 0) return null;
+    var pct = Math.round((recent - base) / base * 100);
+    return { habit: x.h, idx: x.i, recent: Math.round(recent * 100), base: Math.round(base * 100), pct: pct };
+  }).filter(Boolean).filter(function (x) { return Math.abs(x.pct) >= 12; })
+    .sort(function (a, b) { return Math.abs(b.pct) - Math.abs(a.pct); });
+}
+
+function moodTrend(today) {
+  var moods = lsGet(K_MOOD, {}) || {};
+  var pick = function (from, to) {
+    var v = [];
+    for (var k = from; k < to; k++) {
+      var d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - k);
+      var m = moods[La(d.getFullYear(), d.getMonth(), d.getDate())];
+      if (m && m.r) v.push(m.r);
+    }
+    return v;
+  };
+  var a = pick(0, 30), b = pick(30, 120);
+  if (a.length < 5 || b.length < 5) return null;
+  var av = a.reduce(function (p, q) { return p + q; }, 0) / a.length;
+  var bv = b.reduce(function (p, q) { return p + q; }, 0) / b.length;
+  return { recent: Math.round(av * 10) / 10, base: Math.round(bv * 10) / 10, diff: Math.round((av - bv) * 10) / 10, n: a.length };
+}
+
+// best and worst weekday, by habit completion
+function weekdayPattern(habits, checks, today) {
+  var rows = (habits.daily || []).map(function (h, i) { return { h: h, i: i }; }).filter(function (x) { return x.h && x.h.name; });
+  if (!rows.length) return null;
+  var acc = [0, 0, 0, 0, 0, 0, 0].map(function () { return { done: 0, poss: 0 }; });
+  for (var k = 0; k < 120; k++) {
+    var d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - k);
+    var dm = (checks.daily || {})[La(d.getFullYear(), d.getMonth(), d.getDate())] || {};
+    rows.forEach(function (x) {
+      var v = dm[x.i];
+      if (v === "skip") return;
+      acc[d.getDay()].poss++; if (v) acc[d.getDay()].done++;
+    });
+  }
+  var scored = acc.map(function (a, i) { return { day: i, pct: a.poss ? Math.round(a.done / a.poss * 100) : null, poss: a.poss }; })
+    .filter(function (x) { return x.pct !== null && x.poss >= 4; });
+  if (scored.length < 4) return null;
+  scored.sort(function (a, b) { return b.pct - a.pct; });
+  return { best: scored[0], worst: scored[scored.length - 1] };
+}
+
+// ---- Year in Review --------------------------------------------------------
+function yearRecap(habits, checks, today, year) {
+  var y = year || today.getFullYear();
+  var rows = (habits.daily || []).map(function (h, i) { return { h: h, i: i }; }).filter(function (x) { return x.h && x.h.name; });
+  var checkins = 0, perfect = 0, activeDays = 0, possible = 0;
+  var perHabit = rows.map(function (x) { return { h: x.h, i: x.i, n: 0 }; });
+  var start = new Date(y, 0, 1), end = new Date(y, 11, 31);
+  if (end > today) end = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  var cur = new Date(start);
+  while (cur <= end) {
+    var dm = (checks.daily || {})[La(cur.getFullYear(), cur.getMonth(), cur.getDate())] || {};
+    var dDone = 0, dPoss = 0;
+    perHabit.forEach(function (ph) {
+      var v = dm[ph.i];
+      if (v === "skip") return;
+      dPoss++; if (v) { dDone++; ph.n++; }
+    });
+    checkins += dDone; possible += dPoss;
+    if (dDone > 0) activeDays++;
+    if (dPoss > 0 && dDone === dPoss) perfect++;
+    cur.setDate(cur.getDate() + 1);
+  }
+  perHabit.sort(function (a, b) { return b.n - a.n; });
+
+  var moods = lsGet(K_MOOD, {}) || {};
+  var mv = Object.keys(moods).filter(function (k) { return k.indexOf(y + "-") === 0; })
+    .map(function (k) { return moods[k].r; }).filter(Boolean);
+
+  var tasks = readTasks().filter(function (t) { return t.done && t.doneAt && t.doneAt.indexOf(y + "-") === 0; });
+  var spends = allSpends().filter(function (s) { return s.month && s.month.indexOf(y + "-") === 0; });
+  var spendTotal = spends.reduce(function (a, b) { return a + b.amount; }, 0);
+  var topCat = byCategory(spends)[0] || null;
+  var topMerch = byMerchant(spends)[0] || null;
+  var people = readPeople();
+  var contacts = people.reduce(function (a, p) {
+    return a + (p.log || []).filter(function (l) { return String(l.date).indexOf(y + "-") === 0; }).length;
+  }, 0);
+
+  return {
+    year: y, checkins: checkins, possible: possible, perfect: perfect, activeDays: activeDays,
+    pct: possible ? Math.round(checkins / possible * 100) : 0,
+    perHabit: perHabit,
+    mood: mv.length ? Math.round(mv.reduce(function (a, b) { return a + b; }, 0) / mv.length * 10) / 10 : null,
+    moodDays: mv.length,
+    tasks: tasks.length, spendTotal: spendTotal, topCat: topCat, topMerch: topMerch,
+    contacts: contacts
+  };
+}
+
+function YearReview({ habits, checks, today, onClose }) {
+  var yS = (0, o.useState)(today.getFullYear()), year = yS[0], setYear = yS[1];
+  var r = yearRecap(habits, checks, today, year);
+  var years = [today.getFullYear(), today.getFullYear() - 1, today.getFullYear() - 2];
+
+  var big = function (value, label, tint) {
+    return o.default.createElement("div", {
+      style: {
+        flex: 1, minWidth: 0, background: c.bg, borderRadius: "16px", padding: "14px 10px", textAlign: "center"
+      }
+    },
+      o.default.createElement("div", { style: { fontSize: "24px", fontWeight: "800", color: tint || c.ink, letterSpacing: "-0.04em" } }, value),
+      o.default.createElement("div", { style: { fontSize: "10px", fontWeight: "600", color: c.inkFaint, marginTop: "3px", lineHeight: 1.3 } }, label));
+  };
+
+  return o.default.createElement(MSheet, { title: "Your year in Lifestyle", onClose: onClose },
+    years.length > 1 ? o.default.createElement(MChips, {
+      options: years.map(function (y) { return { id: y, label: String(y) }; }),
+      value: year, onChange: setYear
+    }) : null,
+
+    o.default.createElement("div", {
+      style: {
+        background: "linear-gradient(135deg,#af52de,#0a84ff)", borderRadius: "20px", padding: "20px",
+        color: "#fff", marginBottom: "16px", boxShadow: "0 10px 30px rgba(120,80,220,0.3)"
+      }
+    },
+      o.default.createElement("div", { style: { fontSize: "44px", fontWeight: "800", letterSpacing: "-0.05em", lineHeight: 1 } },
+        o.default.createElement(CountUp, { v: r.checkins })),
+      o.default.createElement("div", { style: { fontSize: "14px", opacity: .9, marginTop: "5px", fontWeight: "600" } }, "habit check-ins in " + r.year),
+      o.default.createElement("div", { style: { fontSize: "12.5px", opacity: .8, marginTop: "9px", lineHeight: 1.5 } },
+        r.activeDays + " days you showed up · " + r.perfect + " perfect days · " + r.pct + "% overall")),
+
+    o.default.createElement("div", { style: { display: "flex", gap: "8px", marginBottom: "10px" } },
+      big(r.tasks, "Tasks finished", "#0a84ff"),
+      big(r.contacts, "Catch-ups logged", "#ff9500"),
+      big(r.moodDays ? (moodFor(Math.round(r.mood)) || {}).emoji : "–", r.moodDays ? "Avg mood " + r.mood : "No mood logged", "#34c759")),
+
+    r.spendTotal ? o.default.createElement("div", { style: { display: "flex", gap: "8px", marginBottom: "16px" } },
+      big(fmtINRShort(r.spendTotal), "Tracked spend", "#af52de"),
+      big(r.topCat ? fmtINRShort(r.topCat.amount) : "–", r.topCat ? "Most on " + r.topCat.category : "No categories", "#ff3b30")) : null,
+
+    r.topMerch ? o.default.createElement("div", { style: { marginBottom: "16px" } },
+      o.default.createElement(MSectionLabel, null, "Your most-visited"),
+      o.default.createElement("div", { style: { fontSize: "15px", color: c.ink, lineHeight: 1.5 } },
+        o.default.createElement("b", null, r.topMerch.merchant), " — ", r.topMerch.count, r.topMerch.count === 1 ? " time, " : " times, ", fmtINR(r.topMerch.amount))) : null,
+
+    r.perHabit.length ? o.default.createElement("div", null,
+      o.default.createElement(MSectionLabel, null, "Habit leaderboard"),
+      r.perHabit.slice(0, 10).map(function (ph, i) {
+        var max = r.perHabit[0].n || 1;
+        return o.default.createElement("div", { key: ph.i, style: { display: "flex", alignItems: "center", gap: "10px", padding: "8px 0" } },
+          o.default.createElement("span", { style: { fontSize: "12px", fontWeight: "800", color: c.inkFaint, width: "18px", flexShrink: 0 } }, i + 1),
+          o.default.createElement("span", { style: { fontSize: "16px", flexShrink: 0 } }, ph.h.emoji || "•"),
+          o.default.createElement("span", { style: { flex: 1, minWidth: 0, fontSize: "13.5px", color: c.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, ph.h.name),
+          o.default.createElement("span", { style: { width: "70px", height: "6px", borderRadius: "3px", background: c.borderLt, overflow: "hidden", flexShrink: 0 } },
+            o.default.createElement("span", { style: { display: "block", width: Math.round(ph.n / max * 100) + "%", height: "100%", background: "linear-gradient(90deg,#af52de,#0a84ff)" } })),
+          o.default.createElement("span", { style: { fontSize: "13px", fontWeight: "800", color: c.ink, width: "38px", textAlign: "right", flexShrink: 0 } }, ph.n));
+      })) : null
+  );
+}
+
+// ---- the Insights "Patterns" section ---------------------------------------
+function PatternsSection({ habits, checks, today }) {
+  var mood = moodByHabit(habits, checks, today);
+  var spend = habitVsSpend(habits, checks, today);
+  var trends = habitTrends(habits, checks, today);
+  var mt = moodTrend(today);
+  var wd = weekdayPattern(habits, checks, today);
+  var any = mood.length || spend.length || trends.length || mt || wd;
+
+  var line = function (icon, node, key) {
+    return o.default.createElement("div", { key: key, style: { display: "flex", gap: "11px", alignItems: "flex-start", padding: "9px 0", borderBottom: "0.5px solid " + c.borderLt } },
+      o.default.createElement("span", { style: { fontSize: "17px", flexShrink: 0, lineHeight: 1.3 } }, icon),
+      o.default.createElement("div", { style: { flex: 1, minWidth: 0, fontSize: "13.5px", color: c.ink, lineHeight: 1.5 } }, node));
+  };
+
+  if (!any) {
+    return o.default.createElement("div", { style: { fontSize: "13px", color: c.inkFaint, lineHeight: 1.6 } },
+      "Nothing to correlate yet. Rate your mood on the Today tab for a couple of weeks and upload a statement or two — patterns across habits, mood and spending will show up here.");
+  }
+
+  var out = [];
+  if (mt) out.push(line("📈", o.default.createElement(o.default.Fragment, null,
+    "Your mood over the last 30 days averages ", o.default.createElement("b", null, mt.recent),
+    mt.diff === 0 ? " — the same as your longer-run average." :
+      mt.diff > 0 ? o.default.createElement(o.default.Fragment, null, ", ", o.default.createElement("b", { style: { color: "#1e8e3e" } }, "up " + mt.diff), " on your longer-run average.")
+        : o.default.createElement(o.default.Fragment, null, ", ", o.default.createElement("b", { style: { color: c.red } }, "down " + Math.abs(mt.diff)), " on your longer-run average.")), "mt"));
+
+  mood.slice(0, 3).forEach(function (m, i) {
+    if (Math.abs(m.diff) < 0.3) return;
+    out.push(line(m.habit.emoji || "🙂", o.default.createElement(o.default.Fragment, null,
+      "On days you do ", o.default.createElement("b", null, m.habit.name), " your mood averages ",
+      o.default.createElement("b", { style: { color: m.diff > 0 ? "#1e8e3e" : c.red } }, m.withIt),
+      " versus ", o.default.createElement("b", null, m.without), " when you don't."), "m" + i));
+  });
+
+  spend.forEach(function (s, i) {
+    out.push(line("💸", o.default.createElement(o.default.Fragment, null,
+      "In months you keep up ", o.default.createElement("b", null, s.habit.name), ", you spend ",
+      o.default.createElement("b", { style: { color: s.pct < 0 ? "#1e8e3e" : c.red } }, Math.abs(s.pct) + "% " + (s.pct < 0 ? "less" : "more")),
+      " on ", o.default.createElement("b", null, s.category), " — ", fmtINR(s.good), " against ", fmtINR(s.bad), "."), "s" + i));
+  });
+
+  trends.slice(0, 3).forEach(function (t, i) {
+    out.push(line(t.pct > 0 ? "🔼" : "🔽", o.default.createElement(o.default.Fragment, null,
+      o.default.createElement("b", null, t.habit.name), " is ",
+      o.default.createElement("b", { style: { color: t.pct > 0 ? "#1e8e3e" : c.red } }, (t.pct > 0 ? "up " : "down ") + Math.abs(t.pct) + "%"),
+      " over the last 30 days versus your 90-day baseline (", t.recent, "% against ", t.base, "%)."), "t" + i));
+  });
+
+  if (wd) out.push(line("🗓", o.default.createElement(o.default.Fragment, null,
+    o.default.createElement("b", null, w1[wd.best.day]), " is your strongest day at ", wd.best.pct, "%, ",
+    o.default.createElement("b", null, w1[wd.worst.day]), " your weakest at ", wd.worst.pct, "%."), "wd"));
+
+  return o.default.createElement("div", null, out);
+}
+
 function MClearBtn(onClick) {
   return o.default.createElement("button", {
     className: "p", onClick: onClick, title: "Clear",
@@ -3273,8 +3587,8 @@ function Ey({onClose:t,categories:e,setCategories:l,habits:n,setHabits:a}){useSc
 function InsTile({label,value,sub,icon}){return o.default.createElement("div",{style:{background:"rgba(255,255,255,0.55)",borderRadius:"16px",padding:"12px 14px",border:"0.5px solid rgba(255,255,255,0.6)",boxShadow:"0 4px 16px rgba(31,38,135,0.05), inset 0 1px 0 rgba(255,255,255,0.5)",backdropFilter:"blur(20px) saturate(1.8)",WebkitBackdropFilter:"blur(20px) saturate(1.8)"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:"rgba(60,60,67,0.55)",textTransform:"uppercase",letterSpacing:"0.03em"}},label),o.default.createElement("div",{style:{fontSize:"20px",fontWeight:"800",color:c.ink,letterSpacing:"-0.02em",marginTop:"3px",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}},icon?icon+" ":"",value),sub?o.default.createElement("div",{style:{fontSize:"10px",color:"rgba(60,60,67,0.55)",marginTop:"2px",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}},sub):null)}
 function CountUp({v,fmt,dur}){let[dv,sd]=(0,o.useState)(0),pv=(0,o.useRef)(0);(0,o.useEffect)(()=>{let from=pv.current,st=null,fr,step=ts=>{st===null&&(st=ts);let p2=Math.min(1,(ts-st)/(dur||650)),e2=1-Math.pow(1-p2,3),val=from+(v-from)*e2;sd(val),p2<1?fr=requestAnimationFrame(step):(pv.current=v,sd(v))};fr=requestAnimationFrame(step);return()=>cancelAnimationFrame(fr)},[v]);return fmt?fmt(dv):Math.round(dv)}
 function InsPill({icon,text,bg,fg}){return o.default.createElement("span",{style:{display:"inline-flex",alignItems:"center",gap:"2px",fontSize:"10px",fontWeight:"700",padding:"3px 7px",borderRadius:"999px",flexShrink:0,background:bg,color:fg}},icon,text)}
-function InsightsPage({setModal,habits,checks,categories,today,yr,mo,pctColor,getMonthScore}){useScrollLockWhen(!0);let S=o.useMemo(()=>{let dailyH=habits.daily.map((h,ix)=>({h,ix})).filter(x=>x.h.name),nH=dailyH.length,t0=new Date(today.getFullYear(),today.getMonth(),today.getDate()),dAgo=k=>{let d=new Date(t0);return d.setDate(d.getDate()-k),d},ck=checks.daily||{},keyOf=d=>La(d.getFullYear(),d.getMonth(),d.getDate()),isChk=(d,ix)=>{let m2=ck[keyOf(d)],v2=m2&&m2[ix];return!!v2&&v2!=="skip"},cntOn=d=>{let n=0;for(let i=0;i<nH;i++)isChk(d,dailyH[i].ix)&&n++;return n},actOn=d=>{let m2=ck[keyOf(d)]||{},n=0;for(let i=0;i<nH;i++)if(m2[dailyH[i].ix]!=="skip")n++;return n},pctOn=d=>{let a2=actOn(d);return a2?Math.round(cntOn(d)/a2*100):0},avg=a=>a.length?Math.round(a.reduce((x,y)=>x+y,0)/a.length):0,last7=[];for(let k=6;k>=0;k--){let d=dAgo(k);last7.push({d,pct:pctOn(d)})}let prev7=[];for(let k=13;k>=7;k--)prev7.push(pctOn(dAgo(k)));let avg7=avg(last7.map(x=>x.pct)),delta7=avg7-avg(prev7),td=today.getDate(),perfect=0,checkins=0,possible=0;for(let d2=1;d2<=td;d2++){let cc=cntOn(new Date(yr,mo,d2));checkins+=cc,possible+=nH,nH&&cc===nH&&perfect++}let habitStats=dailyH.map(x=>{let cur=0;for(let k=isChk(t0,x.ix)?0:1;k<3660&&isChk(dAgo(k),x.ix);k++)cur++;let best=0,run=0;for(let k=364;k>=0;k--)isChk(dAgo(k),x.ix)?(run++,run>best&&(best=run)):run=0;let d30=0;for(let k=0;k<30;k++)isChk(dAgo(k),x.ix)&&d30++;return{h:x.h,ix:x.ix,cur,best:Math.max(best,cur),rate30:Math.round(d30/30*100),d30}}).sort((a,b)=>b.rate30-a.rate30),topStreak=habitStats.reduce((m2,x)=>x.cur>(m2?m2.cur:0)?x:m2,null),mTrend=[];for(let j=5;j>=0;j--){let md=new Date(yr,mo-j,1),y2=md.getFullYear(),m2=md.getMonth(),dim=To(y2,m2),sum=0,cnt=0;for(let d2=1;d2<=dim;d2++){let dt=new Date(y2,m2,d2);if(dt>t0)break;sum+=pctOn(dt),cnt++}mTrend.push({label:D1[m2],y:y2,m:m2,score:cnt?Math.round(sum/cnt):0})}let wSum=Array(7).fill(0),wCnt=Array(7).fill(0);for(let k=0;k<56;k++){let d2=dAgo(k);wSum[d2.getDay()]+=pctOn(d2),wCnt[d2.getDay()]++}let wAvg=wSum.map((s2,i2)=>wCnt[i2]?Math.round(s2/wCnt[i2]):0),bestW=0,worstW=0;for(let i2=1;i2<7;i2++)wAvg[i2]>wAvg[bestW]&&(bestW=i2),wAvg[i2]<wAvg[worstW]&&(worstW=i2);let catStats=(categories||[]).map(ct=>{let hs=habitStats.filter(x=>(x.h.category||"general")===ct.id);return hs.length?{label:ct.label,color:ct.color,n:hs.length,rate:avg(hs.map(x=>x.rate30))}:null}).filter(Boolean).sort((a,b)=>b.rate-a.rate),bills=[],cardBills=[],tasks=[],people=[];try{bills=JSON.parse(localStorage.getItem("ht_v12_bills"))||[]}catch(e2){}try{cardBills=JSON.parse(localStorage.getItem("ht_v12_card_bills"))||[]}catch(e2){}try{tasks=JSON.parse(localStorage.getItem("ht_v12_tasks"))||[]}catch(e2){}try{people=JSON.parse(localStorage.getItem("ht_v12_people"))||[]}catch(e2){}let freqMul={monthly:12,quarterly:4,yearly:1},perYear=bills.reduce((s2,b2)=>s2+(Number(b2.amount)||0)*(freqMul[b2.frequency]||12),0),dueMonth=bills.reduce((s2,b2)=>{let hist=(b2.history||[]).filter(h2=>{let hd=new Date(h2.date+"T00:00:00");return hd.getFullYear()===yr&&hd.getMonth()===mo});if(hist.length)return s2+(hist[0].amount!=null?hist[0].amount:Number(b2.amount)||0);let nd=new Date(b2.dueDate+"T00:00:00");if(isNaN(nd))return s2;let dy2=nd.getFullYear(),dm2=nd.getMonth();if(dy2>yr||dy2===yr&&dm2>mo)return s2;let diff=(yr-dy2)*12+(mo-dm2),fr=b2.frequency||"monthly";return fr==="monthly"||fr==="quarterly"&&diff%3===0||fr==="yearly"&&diff%12===0?s2+(Number(b2.amount)||0):s2},0),pad=n2=>(n2<10?"0":"")+n2,isoLocal=d2=>d2.getFullYear()+"-"+pad(d2.getMonth()+1)+"-"+pad(d2.getDate()),todayIso=isoLocal(t0),pending=tasks.filter(x=>!x.done).length,overdue=tasks.filter(x=>!x.done&&x.dueDate&&x.dueDate<todayIso).length,cutoff30=isoLocal(dAgo(30)),done30=tasks.filter(x=>x.done&&x.doneAt&&x.doneAt>=cutoff30).length,msDay=864e5,dueP=people.filter(p2=>{if(!p2.lastContact)return!0;let lc=new Date(p2.lastContact+"T00:00:00");if(isNaN(lc))return!1;return Math.floor((t0-lc)/msDay)>(Number(p2.dueInDays)||7)}).length,events=[];let cardLatest=[...cardBills].sort((a2,b2)=>(b2.month||"").localeCompare(a2.month||""))[0]||null,cardLatestTot=cardLatest?Number(cardLatest.total)||0:0,cardLatestMonth=cardLatest&&cardLatest.month?D1[Number(cardLatest.month.split("-")[1])-1]:"",cardAllTot=cardBills.reduce((s2,x2)=>s2+(Number(x2.total)||0),0);return people.forEach(p2=>{[["birthday","\u{1F382}"],["anniversary","\u{1F48D}"]].forEach(pair=>{let v2=p2[pair[0]];if(!v2)return;let bd=new Date(v2+"T00:00:00");if(isNaN(bd))return;let nx=new Date(t0.getFullYear(),bd.getMonth(),bd.getDate());nx<t0&&(nx=new Date(t0.getFullYear()+1,bd.getMonth(),bd.getDate()));let dd2=Math.round((nx-t0)/msDay);dd2<=30&&events.push({name:p2.name,icon:pair[1],days:dd2})})}),events.sort((a,b)=>a.days-b.days),{nH,last7,avg7,delta7,perfect,checkins,possible,habitStats,topStreak,mTrend,wAvg,bestW,worstW,catStats,bills,perYear,dueMonth,cardBills,cardLatestTot,cardLatestMonth,cardAllTot,pending,overdue,done30,people,dueP,events,todayPct:pctOn(t0)}},[habits,checks,categories,today,yr,mo]);let[selM,setSelM]=o.useState({y:yr,m:mo}),[selCat,setSelCat]=o.useState(null),[sortBy,setSortBy]=o.useState("days"),mStats=o.useMemo(()=>{let ck=checks.daily||{},dim=To(selM.y,selM.m),limit=selM.y===yr&&selM.m===mo?today.getDate():dim;return S.habitStats.map(x=>{let cnt=0;for(let d2=1;d2<=limit;d2++){let m2=ck[La(selM.y,selM.m,d2)];m2&&m2[x.ix]&&cnt++}return Object.assign({},x,{cnt,limit})}).sort((a,b)=>b.cnt-a.cnt)},[S,selM,checks,yr,mo,today]);let ms=getMonthScore(),grade=ms>=90?"A+":ms>=80?"A":ms>=70?"B":ms>=60?"C":ms>=40?"D":"F",gcol=ms>=80?"#34c759":ms>=60?"#8ecbff":ms>=40?"#ffd08a":"#ffb3ad",money=v2=>"₹"+Math.round(v2).toLocaleString(),WD=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"],WL=["S","M","T","W","T","F","S"],back=()=>setModal({type:"profile"});return o.default.createElement("div",{className:"insights-page",style:{position:"fixed",inset:0,zIndex:150,background:"linear-gradient(180deg,#e8ecf5 0%,#eef1f8 35%,#f2f2f7 100%)",overflowY:"auto",WebkitOverflowScrolling:"touch",overscrollBehavior:"contain"}},o.default.createElement("div",{style:{maxWidth:"min(100%,720px)",margin:"0 auto",padding:"16px",paddingBottom:"48px",fontFamily:"-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif"}},o.default.createElement("div",{style:{position:"sticky",top:0,zIndex:40,background:"rgba(236,240,247,0.92)",backdropFilter:"blur(24px)",WebkitBackdropFilter:"blur(24px)",margin:"-16px -16px 14px",padding:"12px 16px",display:"flex",alignItems:"center",gap:"10px"}},o.default.createElement("button",{className:"p",onClick:back,style:{width:"36px",height:"36px",borderRadius:"50%",border:"0.5px solid rgba(255,255,255,0.7)",background:"rgba(255,255,255,0.75)",cursor:"pointer",fontSize:"22px",display:"flex",alignItems:"center",justifyContent:"center",color:c.ink,boxShadow:"0 2px 8px rgba(31,38,135,0.08)",flexShrink:0,paddingBottom:"2px"}},"‹"),o.default.createElement("div",{style:{fontSize:"22px",fontWeight:"800",color:c.ink,letterSpacing:"-0.02em",flex:1}},"Insights"),o.default.createElement(HeaderAvatar,{onClick:back})),o.default.createElement("div",{style:{background:"linear-gradient(135deg,#3FA8FF 0%,#0A7CFF 48%,#0052D4 100%)",borderRadius:"20px",padding:"18px",marginBottom:"12px",boxShadow:"0 10px 30px rgba(10,124,255,0.35)",color:"#fff",position:"relative",overflow:"hidden"}},o.default.createElement("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between"}},o.default.createElement("div",null,o.default.createElement("div",{style:{fontSize:"11px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.05em",opacity:.85}},Mo[mo]," so far"),o.default.createElement("div",{style:{fontSize:"44px",fontWeight:"800",letterSpacing:"-0.03em",lineHeight:1.1}},o.default.createElement(CountUp,{v:ms}),"%"),o.default.createElement("div",{style:{fontSize:"12px",opacity:.9,marginTop:"4px"}},"Today ",S.todayPct,"% · 7-day avg ",S.avg7,"%",S.delta7!==0?o.default.createElement("span",{style:{fontWeight:"700",marginLeft:"6px"}},S.delta7>0?"▲ +"+S.delta7:"▼ "+S.delta7,"% vs last week"):null)),o.default.createElement("div",{style:{width:"64px",height:"64px",borderRadius:"18px",background:"rgba(255,255,255,0.18)",border:"1px solid rgba(255,255,255,0.35)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"30px",fontWeight:"800",color:gcol,flexShrink:0}},grade))),o.default.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"12px"}},o.default.createElement(InsTile,{label:"Perfect days",icon:"✨",value:S.perfect,sub:"of "+today.getDate()+" this month"}),o.default.createElement(InsTile,{label:"Check-ins",icon:"✅",value:S.checkins,sub:"of "+S.possible+" possible"}),o.default.createElement(InsTile,{label:"Best streak",icon:"\u{1F525}",value:S.topStreak&&S.topStreak.cur>0?S.topStreak.cur+"d":"—",sub:S.topStreak&&S.topStreak.cur>0?S.topStreak.h.name:"start one today"}),o.default.createElement(InsTile,{label:"Active habits",icon:"\u{1F3AF}",value:S.nH,sub:S.catStats.length+" categor"+(S.catStats.length===1?"y":"ies")})),o.default.createElement(InsCard,{title:"Last 7 days"},o.default.createElement("div",{style:{display:"flex",gap:"6px",alignItems:"flex-end",height:"92px"}},S.last7.map((d2,i2)=>o.default.createElement("div",{key:i2,style:{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:"4px",height:"100%",justifyContent:"flex-end"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:"rgba(60,60,67,0.55)"}},d2.pct),o.default.createElement("div",{style:{width:"100%",maxWidth:"30px",height:Math.max(3,Math.round(d2.pct*.56))+"px",borderRadius:"6px",background:d2.pct?pctColor(d2.pct):"rgba(60,60,67,0.12)",transition:"height 0.3s"}}),o.default.createElement("div",{style:{fontSize:"9px",fontWeight:i2===6?"800":"500",color:i2===6?c.ink:"rgba(60,60,67,0.5)"}},WL[d2.d.getDay()])))),o.default.createElement("div",{style:{fontSize:"11px",color:"rgba(60,60,67,0.55)",marginTop:"10px"}},"Best day: ",o.default.createElement("b",{style:{color:c.ink}},WD[S.bestW]," (",S.wAvg[S.bestW],"%)")," · Toughest: ",o.default.createElement("b",{style:{color:c.ink}},WD[S.worstW]," (",S.wAvg[S.worstW],"%)"),o.default.createElement("span",{style:{display:"block",marginTop:"2px"}},"Averages over the last 8 weeks"))),o.default.createElement(InsCard,{title:"6-month trend"},o.default.createElement("div",{style:{display:"flex",gap:"8px",alignItems:"flex-end",height:"104px"}},S.mTrend.map((m2,i2)=>{let sel=m2.y===selM.y&&m2.m===selM.m;return o.default.createElement("div",{key:i2,className:"p",onClick:()=>setSelM({y:m2.y,m:m2.m}),style:{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:"4px",height:"100%",justifyContent:"flex-end",cursor:"pointer"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:sel?c.ink:"rgba(60,60,67,0.55)"}},m2.score),o.default.createElement("div",{style:{width:"100%",maxWidth:"36px",height:Math.max(3,Math.round(m2.score*.68))+"px",borderRadius:"7px",background:sel?"linear-gradient(180deg,#3FA8FF,#0A7CFF)":"rgba(10,124,255,0.28)",transition:"height 0.3s"}}),o.default.createElement("div",{style:{fontSize:"9px",fontWeight:sel?"800":"500",color:sel?c.ink:"rgba(60,60,67,0.5)"}},m2.label))})),o.default.createElement("div",{style:{fontSize:"10px",color:"rgba(60,60,67,0.45)",marginTop:"8px"}},"Tap a month to see habit stats for it below")),S.habitStats.length>0&&o.default.createElement(InsCard,{title:"Habit stats · "+Mo[selM.m]+(selM.y===today.getFullYear()?"":" "+selM.y)},o.default.createElement("div",{style:{display:"flex",gap:"6px",overflowX:"auto",paddingBottom:"2px",marginBottom:"8px"}},[{id:null,label:"All"}].concat((categories||[]).filter(ct=>S.habitStats.some(x=>(x.h.category||"general")===ct.id))).map((ct,i2)=>{let on=selCat===ct.id;return o.default.createElement("button",{key:i2,className:"p",onClick:()=>setSelCat(ct.id),style:{flexShrink:0,border:"none",cursor:"pointer",fontSize:"11px",fontWeight:"700",padding:"6px 12px",borderRadius:"999px",background:on?"linear-gradient(135deg,#3FA8FF,#0A7CFF)":"rgba(255,255,255,0.7)",color:on?"#fff":c.ink,boxShadow:on?"0 2px 8px rgba(10,124,255,0.35)":"0 1px 4px rgba(31,38,135,0.08)"}},ct.label)})),o.default.createElement("div",{style:{background:"rgba(118,118,128,0.12)",borderRadius:"10px",padding:"2px",display:"flex",gap:"2px",marginBottom:"14px"}},[["days","✓ Days done"],["cur","\u{1F525} Streak"],["best","\u{1F3C6} Best"]].map(([v,k2])=>o.default.createElement("button",{key:v,className:"p",onClick:()=>setSortBy(v),style:{flex:1,border:"none",cursor:"pointer",fontSize:"11px",fontWeight:sortBy===v?"700":"500",padding:"6px 0",borderRadius:"8px",background:sortBy===v?"rgba(255,255,255,0.95)":"transparent",color:sortBy===v?c.ink:"rgba(60,60,67,0.6)",boxShadow:sortBy===v?"0 1px 4px rgba(0,0,0,0.1)":"none"}},k2))),(()=>{let sk=sortBy==="cur"?x=>x.cur:sortBy==="best"?x=>x.best:x=>x.cnt,gs=(categories||[]).map(ct=>({ct,rows:mStats.filter(x=>(x.h.category||"general")===ct.id).sort((a,b)=>sk(b)-sk(a)||b.cnt-a.cnt)})).filter(g=>g.rows.length&&(selCat===null||selCat===g.ct.id));return gs.length?gs.map((g,gi)=>o.default.createElement("div",{key:g.ct.id,style:{marginBottom:gi===gs.length-1?0:"14px"}},o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"6px",marginBottom:"8px"}},o.default.createElement("span",{style:{width:"7px",height:"7px",borderRadius:"50%",background:g.ct.color||"#007aff",flexShrink:0,boxShadow:"0 0 6px "+(g.ct.color||"#007aff")+"88"}}),o.default.createElement("span",{style:{fontSize:"11px",fontWeight:"700",color:g.ct.color||"#007aff",letterSpacing:"0.02em"}},g.ct.label)),g.rows.map((x,i2)=>{let pctM=x.limit?Math.round(x.cnt/x.limit*100):0,dc=pctM>=70?["rgba(52,199,89,0.14)","#1e8e3e"]:pctM>=40?["rgba(255,149,0,0.14)","#b25e00"]:["rgba(60,60,67,0.08)","rgba(60,60,67,0.55)"];return o.default.createElement("div",{key:i2,style:{display:"flex",alignItems:"center",gap:"7px",marginBottom:i2===g.rows.length-1?0:"10px"}},o.default.createElement("span",{style:{fontSize:"16px",flexShrink:0}},x.h.emoji||"●"),o.default.createElement("span",{style:{flex:1,fontSize:"13px",fontWeight:"600",color:c.ink,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",minWidth:0}},x.h.name),o.default.createElement(InsPill,{icon:"\u{1F525}",text:x.cur+"d",bg:x.cur>0?"rgba(255,103,35,0.13)":"rgba(60,60,67,0.08)",fg:x.cur>0?"#e05a1a":"rgba(60,60,67,0.5)"}),o.default.createElement(InsPill,{icon:"\u{1F3C6}",text:x.best+"d",bg:"rgba(255,204,0,0.16)",fg:"#8a6a00"}),o.default.createElement(InsPill,{icon:"✓",text:x.cnt+"/"+x.limit,bg:dc[0],fg:dc[1]}))})))
-:o.default.createElement("div",{style:{fontSize:"12px",color:"rgba(60,60,67,0.5)"}},"No habits in this category")})()),S.catStats.length>1&&o.default.createElement(InsCard,{title:"By category · 30 days"},S.catStats.map((ct,i2)=>o.default.createElement("div",{key:i2,style:{display:"flex",alignItems:"center",gap:"10px",marginBottom:i2===S.catStats.length-1?0:"10px"}},o.default.createElement("span",{style:{width:"10px",height:"10px",borderRadius:"50%",background:ct.color||"#007aff",flexShrink:0}}),o.default.createElement("span",{style:{flex:1,fontSize:"13px",fontWeight:"600",color:c.ink}},ct.label,o.default.createElement("span",{style:{fontWeight:"400",color:"rgba(60,60,67,0.5)",fontSize:"11px"}}," · ",ct.n," habit",ct.n===1?"":"s")),o.default.createElement("div",{style:{width:"110px",height:"7px",borderRadius:"4px",background:"rgba(60,60,67,0.1)",overflow:"hidden",flexShrink:0}},o.default.createElement("div",{style:{width:ct.rate+"%",height:"100%",borderRadius:"4px",background:pctColor(ct.rate)}})),o.default.createElement("span",{style:{fontSize:"12px",fontWeight:"800",color:pctColor(ct.rate),minWidth:"36px",textAlign:"right"}},ct.rate,"%")))),o.default.createElement(InsCard,{title:"Life summary"},o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"12px",marginBottom:"12px"}},o.default.createElement("span",{style:{fontSize:"20px"}},"\u{1F501}"),o.default.createElement("div",{style:{flex:1}},o.default.createElement("div",{style:{fontSize:"13px",fontWeight:"600",color:c.ink}},"Payments"),o.default.createElement("div",{style:{fontSize:"11px",color:"rgba(60,60,67,0.55)"}},S.bills.length?S.bills.length+" bill"+(S.bills.length===1?"":"s")+" · "+money(S.perYear)+"/yr · "+money(S.dueMonth)+" in "+D1[mo]:"No bills added yet")),S.bills.length?o.default.createElement("span",{style:{fontSize:"14px",fontWeight:"800",color:c.ink}},money(S.dueMonth)):null),o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"12px",marginBottom:"12px"}},o.default.createElement("span",{style:{fontSize:"20px"}},"\u{1F4B3}"),o.default.createElement("div",{style:{flex:1}},o.default.createElement("div",{style:{fontSize:"13px",fontWeight:"600",color:c.ink}},"Card bills"),o.default.createElement("div",{style:{fontSize:"11px",color:"rgba(60,60,67,0.55)"}},S.cardBills.length?S.cardBills.length+" statement"+(S.cardBills.length===1?"":"s")+" \u00b7 "+money(S.cardAllTot)+" tracked":"No statements added yet")),S.cardBills.length?o.default.createElement("span",{style:{fontSize:"14px",fontWeight:"800",color:c.ink}},money(S.cardLatestTot)):null),o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"12px",marginBottom:"12px"}},o.default.createElement("span",{style:{fontSize:"20px"}},"☑️"),o.default.createElement("div",{style:{flex:1}},o.default.createElement("div",{style:{fontSize:"13px",fontWeight:"600",color:c.ink}},"Tasks"),o.default.createElement("div",{style:{fontSize:"11px",color:"rgba(60,60,67,0.55)"}},S.pending+" pending"+(S.overdue?" · "+S.overdue+" overdue":"")+" · "+S.done30+" done in 30d")),S.overdue>0&&o.default.createElement("span",{style:{fontSize:"11px",fontWeight:"700",color:"#ff3b30",background:"rgba(255,59,48,0.12)",padding:"3px 8px",borderRadius:"8px"}},S.overdue," overdue")),o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"12px"}},o.default.createElement("span",{style:{fontSize:"20px"}},"\u{1F465}"),o.default.createElement("div",{style:{flex:1}},o.default.createElement("div",{style:{fontSize:"13px",fontWeight:"600",color:c.ink}},"People"),o.default.createElement("div",{style:{fontSize:"11px",color:"rgba(60,60,67,0.55)"}},S.people.length?S.people.length+" · "+S.dueP+" to reach out":"No people added yet")),S.dueP>0&&o.default.createElement("span",{style:{fontSize:"11px",fontWeight:"700",color:"#ff9500",background:"rgba(255,149,0,0.12)",padding:"3px 8px",borderRadius:"8px"}},S.dueP," due")),S.events.length>0&&o.default.createElement("div",{style:{marginTop:"12px",paddingTop:"12px",borderTop:"0.5px solid rgba(60,60,67,0.12)"}},o.default.createElement("div",{style:{fontSize:"10px",fontWeight:"700",color:"rgba(60,60,67,0.55)",textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:"8px"}},"Coming up"),S.events.slice(0,4).map((ev,i2)=>o.default.createElement("div",{key:i2,style:{display:"flex",alignItems:"center",gap:"8px",marginBottom:i2===Math.min(S.events.length,4)-1?0:"6px"}},o.default.createElement("span",{style:{fontSize:"15px"}},ev.icon),o.default.createElement("span",{style:{flex:1,fontSize:"12px",fontWeight:"600",color:c.ink}},ev.name),o.default.createElement("span",{style:{fontSize:"11px",fontWeight:"700",color:"#0A7CFF"}},ev.days===0?"Today!":ev.days===1?"Tomorrow":"in "+ev.days+"d")))))))}
+function InsightsPage({setModal,habits,checks,categories,today,yr,mo,pctColor,getMonthScore}){useScrollLockWhen(!0);let[yrOpen,setYrOpen]=(0,o.useState)(!1);let S=o.useMemo(()=>{let dailyH=habits.daily.map((h,ix)=>({h,ix})).filter(x=>x.h.name),nH=dailyH.length,t0=new Date(today.getFullYear(),today.getMonth(),today.getDate()),dAgo=k=>{let d=new Date(t0);return d.setDate(d.getDate()-k),d},ck=checks.daily||{},keyOf=d=>La(d.getFullYear(),d.getMonth(),d.getDate()),isChk=(d,ix)=>{let m2=ck[keyOf(d)],v2=m2&&m2[ix];return!!v2&&v2!=="skip"},cntOn=d=>{let n=0;for(let i=0;i<nH;i++)isChk(d,dailyH[i].ix)&&n++;return n},actOn=d=>{let m2=ck[keyOf(d)]||{},n=0;for(let i=0;i<nH;i++)if(m2[dailyH[i].ix]!=="skip")n++;return n},pctOn=d=>{let a2=actOn(d);return a2?Math.round(cntOn(d)/a2*100):0},avg=a=>a.length?Math.round(a.reduce((x,y)=>x+y,0)/a.length):0,last7=[];for(let k=6;k>=0;k--){let d=dAgo(k);last7.push({d,pct:pctOn(d)})}let prev7=[];for(let k=13;k>=7;k--)prev7.push(pctOn(dAgo(k)));let avg7=avg(last7.map(x=>x.pct)),delta7=avg7-avg(prev7),td=today.getDate(),perfect=0,checkins=0,possible=0;for(let d2=1;d2<=td;d2++){let cc=cntOn(new Date(yr,mo,d2));checkins+=cc,possible+=nH,nH&&cc===nH&&perfect++}let habitStats=dailyH.map(x=>{let cur=0;for(let k=isChk(t0,x.ix)?0:1;k<3660&&isChk(dAgo(k),x.ix);k++)cur++;let best=0,run=0;for(let k=364;k>=0;k--)isChk(dAgo(k),x.ix)?(run++,run>best&&(best=run)):run=0;let d30=0;for(let k=0;k<30;k++)isChk(dAgo(k),x.ix)&&d30++;return{h:x.h,ix:x.ix,cur,best:Math.max(best,cur),rate30:Math.round(d30/30*100),d30}}).sort((a,b)=>b.rate30-a.rate30),topStreak=habitStats.reduce((m2,x)=>x.cur>(m2?m2.cur:0)?x:m2,null),mTrend=[];for(let j=5;j>=0;j--){let md=new Date(yr,mo-j,1),y2=md.getFullYear(),m2=md.getMonth(),dim=To(y2,m2),sum=0,cnt=0;for(let d2=1;d2<=dim;d2++){let dt=new Date(y2,m2,d2);if(dt>t0)break;sum+=pctOn(dt),cnt++}mTrend.push({label:D1[m2],y:y2,m:m2,score:cnt?Math.round(sum/cnt):0})}let wSum=Array(7).fill(0),wCnt=Array(7).fill(0);for(let k=0;k<56;k++){let d2=dAgo(k);wSum[d2.getDay()]+=pctOn(d2),wCnt[d2.getDay()]++}let wAvg=wSum.map((s2,i2)=>wCnt[i2]?Math.round(s2/wCnt[i2]):0),bestW=0,worstW=0;for(let i2=1;i2<7;i2++)wAvg[i2]>wAvg[bestW]&&(bestW=i2),wAvg[i2]<wAvg[worstW]&&(worstW=i2);let catStats=(categories||[]).map(ct=>{let hs=habitStats.filter(x=>(x.h.category||"general")===ct.id);return hs.length?{label:ct.label,color:ct.color,n:hs.length,rate:avg(hs.map(x=>x.rate30))}:null}).filter(Boolean).sort((a,b)=>b.rate-a.rate),bills=[],cardBills=[],tasks=[],people=[];try{bills=JSON.parse(localStorage.getItem("ht_v12_bills"))||[]}catch(e2){}try{cardBills=JSON.parse(localStorage.getItem("ht_v12_card_bills"))||[]}catch(e2){}try{tasks=JSON.parse(localStorage.getItem("ht_v12_tasks"))||[]}catch(e2){}try{people=JSON.parse(localStorage.getItem("ht_v12_people"))||[]}catch(e2){}let freqMul={monthly:12,quarterly:4,yearly:1},perYear=bills.reduce((s2,b2)=>s2+(Number(b2.amount)||0)*(freqMul[b2.frequency]||12),0),dueMonth=bills.reduce((s2,b2)=>{let hist=(b2.history||[]).filter(h2=>{let hd=new Date(h2.date+"T00:00:00");return hd.getFullYear()===yr&&hd.getMonth()===mo});if(hist.length)return s2+(hist[0].amount!=null?hist[0].amount:Number(b2.amount)||0);let nd=new Date(b2.dueDate+"T00:00:00");if(isNaN(nd))return s2;let dy2=nd.getFullYear(),dm2=nd.getMonth();if(dy2>yr||dy2===yr&&dm2>mo)return s2;let diff=(yr-dy2)*12+(mo-dm2),fr=b2.frequency||"monthly";return fr==="monthly"||fr==="quarterly"&&diff%3===0||fr==="yearly"&&diff%12===0?s2+(Number(b2.amount)||0):s2},0),pad=n2=>(n2<10?"0":"")+n2,isoLocal=d2=>d2.getFullYear()+"-"+pad(d2.getMonth()+1)+"-"+pad(d2.getDate()),todayIso=isoLocal(t0),pending=tasks.filter(x=>!x.done).length,overdue=tasks.filter(x=>!x.done&&x.dueDate&&x.dueDate<todayIso).length,cutoff30=isoLocal(dAgo(30)),done30=tasks.filter(x=>x.done&&x.doneAt&&x.doneAt>=cutoff30).length,msDay=864e5,dueP=people.filter(p2=>{if(!p2.lastContact)return!0;let lc=new Date(p2.lastContact+"T00:00:00");if(isNaN(lc))return!1;return Math.floor((t0-lc)/msDay)>(Number(p2.dueInDays)||7)}).length,events=[];let cardLatest=[...cardBills].sort((a2,b2)=>(b2.month||"").localeCompare(a2.month||""))[0]||null,cardLatestTot=cardLatest?Number(cardLatest.total)||0:0,cardLatestMonth=cardLatest&&cardLatest.month?D1[Number(cardLatest.month.split("-")[1])-1]:"",cardAllTot=cardBills.reduce((s2,x2)=>s2+(Number(x2.total)||0),0);return people.forEach(p2=>{[["birthday","\u{1F382}"],["anniversary","\u{1F48D}"]].forEach(pair=>{let v2=p2[pair[0]];if(!v2)return;let bd=new Date(v2+"T00:00:00");if(isNaN(bd))return;let nx=new Date(t0.getFullYear(),bd.getMonth(),bd.getDate());nx<t0&&(nx=new Date(t0.getFullYear()+1,bd.getMonth(),bd.getDate()));let dd2=Math.round((nx-t0)/msDay);dd2<=30&&events.push({name:p2.name,icon:pair[1],days:dd2})})}),events.sort((a,b)=>a.days-b.days),{nH,last7,avg7,delta7,perfect,checkins,possible,habitStats,topStreak,mTrend,wAvg,bestW,worstW,catStats,bills,perYear,dueMonth,cardBills,cardLatestTot,cardLatestMonth,cardAllTot,pending,overdue,done30,people,dueP,events,todayPct:pctOn(t0)}},[habits,checks,categories,today,yr,mo]);let[selM,setSelM]=o.useState({y:yr,m:mo}),[selCat,setSelCat]=o.useState(null),[sortBy,setSortBy]=o.useState("days"),mStats=o.useMemo(()=>{let ck=checks.daily||{},dim=To(selM.y,selM.m),limit=selM.y===yr&&selM.m===mo?today.getDate():dim;return S.habitStats.map(x=>{let cnt=0;for(let d2=1;d2<=limit;d2++){let m2=ck[La(selM.y,selM.m,d2)];m2&&m2[x.ix]&&cnt++}return Object.assign({},x,{cnt,limit})}).sort((a,b)=>b.cnt-a.cnt)},[S,selM,checks,yr,mo,today]);let ms=getMonthScore(),grade=ms>=90?"A+":ms>=80?"A":ms>=70?"B":ms>=60?"C":ms>=40?"D":"F",gcol=ms>=80?"#34c759":ms>=60?"#8ecbff":ms>=40?"#ffd08a":"#ffb3ad",money=v2=>"₹"+Math.round(v2).toLocaleString(),WD=["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"],WL=["S","M","T","W","T","F","S"],back=()=>setModal({type:"profile"});return o.default.createElement("div",{className:"insights-page",style:{position:"fixed",inset:0,zIndex:150,background:"linear-gradient(180deg,#e8ecf5 0%,#eef1f8 35%,#f2f2f7 100%)",overflowY:"auto",WebkitOverflowScrolling:"touch",overscrollBehavior:"contain"}},o.default.createElement("div",{style:{maxWidth:"min(100%,720px)",margin:"0 auto",padding:"16px",paddingBottom:"48px",fontFamily:"-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif"}},o.default.createElement("div",{style:{position:"sticky",top:0,zIndex:40,background:"rgba(236,240,247,0.92)",backdropFilter:"blur(24px)",WebkitBackdropFilter:"blur(24px)",margin:"-16px -16px 14px",padding:"12px 16px",display:"flex",alignItems:"center",gap:"10px"}},o.default.createElement("button",{className:"p",onClick:back,style:{width:"36px",height:"36px",borderRadius:"50%",border:"0.5px solid rgba(255,255,255,0.7)",background:"rgba(255,255,255,0.75)",cursor:"pointer",fontSize:"22px",display:"flex",alignItems:"center",justifyContent:"center",color:c.ink,boxShadow:"0 2px 8px rgba(31,38,135,0.08)",flexShrink:0,paddingBottom:"2px"}},"‹"),o.default.createElement("div",{style:{fontSize:"22px",fontWeight:"800",color:c.ink,letterSpacing:"-0.02em",flex:1}},"Insights"),o.default.createElement(HeaderAvatar,{onClick:back})),o.default.createElement("div",{style:{background:"linear-gradient(135deg,#3FA8FF 0%,#0A7CFF 48%,#0052D4 100%)",borderRadius:"20px",padding:"18px",marginBottom:"12px",boxShadow:"0 10px 30px rgba(10,124,255,0.35)",color:"#fff",position:"relative",overflow:"hidden"}},o.default.createElement("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between"}},o.default.createElement("div",null,o.default.createElement("div",{style:{fontSize:"11px",fontWeight:"700",textTransform:"uppercase",letterSpacing:"0.05em",opacity:.85}},Mo[mo]," so far"),o.default.createElement("div",{style:{fontSize:"44px",fontWeight:"800",letterSpacing:"-0.03em",lineHeight:1.1}},o.default.createElement(CountUp,{v:ms}),"%"),o.default.createElement("div",{style:{fontSize:"12px",opacity:.9,marginTop:"4px"}},"Today ",S.todayPct,"% · 7-day avg ",S.avg7,"%",S.delta7!==0?o.default.createElement("span",{style:{fontWeight:"700",marginLeft:"6px"}},S.delta7>0?"▲ +"+S.delta7:"▼ "+S.delta7,"% vs last week"):null)),o.default.createElement("div",{style:{width:"64px",height:"64px",borderRadius:"18px",background:"rgba(255,255,255,0.18)",border:"1px solid rgba(255,255,255,0.35)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:"30px",fontWeight:"800",color:gcol,flexShrink:0}},grade))),o.default.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"12px"}},o.default.createElement(InsTile,{label:"Perfect days",icon:"✨",value:S.perfect,sub:"of "+today.getDate()+" this month"}),o.default.createElement(InsTile,{label:"Check-ins",icon:"✅",value:S.checkins,sub:"of "+S.possible+" possible"}),o.default.createElement(InsTile,{label:"Best streak",icon:"\u{1F525}",value:S.topStreak&&S.topStreak.cur>0?S.topStreak.cur+"d":"—",sub:S.topStreak&&S.topStreak.cur>0?S.topStreak.h.name:"start one today"}),o.default.createElement(InsTile,{label:"Active habits",icon:"\u{1F3AF}",value:S.nH,sub:S.catStats.length+" categor"+(S.catStats.length===1?"y":"ies")})),o.default.createElement(InsCard,{title:"Last 7 days"},o.default.createElement("div",{style:{display:"flex",gap:"6px",alignItems:"flex-end",height:"92px"}},S.last7.map((d2,i2)=>o.default.createElement("div",{key:i2,style:{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:"4px",height:"100%",justifyContent:"flex-end"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:"rgba(60,60,67,0.55)"}},d2.pct),o.default.createElement("div",{style:{width:"100%",maxWidth:"30px",height:Math.max(3,Math.round(d2.pct*.56))+"px",borderRadius:"6px",background:d2.pct?pctColor(d2.pct):"rgba(60,60,67,0.12)",transition:"height 0.3s"}}),o.default.createElement("div",{style:{fontSize:"9px",fontWeight:i2===6?"800":"500",color:i2===6?c.ink:"rgba(60,60,67,0.5)"}},WL[d2.d.getDay()])))),o.default.createElement("div",{style:{fontSize:"11px",color:"rgba(60,60,67,0.55)",marginTop:"10px"}},"Best day: ",o.default.createElement("b",{style:{color:c.ink}},WD[S.bestW]," (",S.wAvg[S.bestW],"%)")," · Toughest: ",o.default.createElement("b",{style:{color:c.ink}},WD[S.worstW]," (",S.wAvg[S.worstW],"%)"),o.default.createElement("span",{style:{display:"block",marginTop:"2px"}},"Averages over the last 8 weeks"))),o.default.createElement(InsCard,{title:"6-month trend"},o.default.createElement("div",{style:{display:"flex",gap:"8px",alignItems:"flex-end",height:"104px"}},S.mTrend.map((m2,i2)=>{let sel=m2.y===selM.y&&m2.m===selM.m;return o.default.createElement("div",{key:i2,className:"p",onClick:()=>setSelM({y:m2.y,m:m2.m}),style:{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:"4px",height:"100%",justifyContent:"flex-end",cursor:"pointer"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:sel?c.ink:"rgba(60,60,67,0.55)"}},m2.score),o.default.createElement("div",{style:{width:"100%",maxWidth:"36px",height:Math.max(3,Math.round(m2.score*.68))+"px",borderRadius:"7px",background:sel?"linear-gradient(180deg,#3FA8FF,#0A7CFF)":"rgba(10,124,255,0.28)",transition:"height 0.3s"}}),o.default.createElement("div",{style:{fontSize:"9px",fontWeight:sel?"800":"500",color:sel?c.ink:"rgba(60,60,67,0.5)"}},m2.label))})),o.default.createElement("div",{style:{fontSize:"10px",color:"rgba(60,60,67,0.45)",marginTop:"8px"}},"Tap a month to see habit stats for it below")),S.habitStats.length>0&&o.default.createElement(InsCard,{title:"Habit stats · "+Mo[selM.m]+(selM.y===today.getFullYear()?"":" "+selM.y)},o.default.createElement("div",{style:{display:"flex",gap:"6px",overflowX:"auto",paddingBottom:"2px",marginBottom:"8px"}},[{id:null,label:"All"}].concat((categories||[]).filter(ct=>S.habitStats.some(x=>(x.h.category||"general")===ct.id))).map((ct,i2)=>{let on=selCat===ct.id;return o.default.createElement("button",{key:i2,className:"p",onClick:()=>setSelCat(ct.id),style:{flexShrink:0,border:"none",cursor:"pointer",fontSize:"11px",fontWeight:"700",padding:"6px 12px",borderRadius:"999px",background:on?"linear-gradient(135deg,#3FA8FF,#0A7CFF)":"rgba(255,255,255,0.7)",color:on?"#fff":c.ink,boxShadow:on?"0 2px 8px rgba(10,124,255,0.35)":"0 1px 4px rgba(31,38,135,0.08)"}},ct.label)})),o.default.createElement("div",{style:{background:"rgba(118,118,128,0.12)",borderRadius:"10px",padding:"2px",display:"flex",gap:"2px",marginBottom:"14px"}},[["days","✓ Days done"],["cur","\u{1F525} Streak"],["best","\u{1F3C6} Best"]].map(([v,k2])=>o.default.createElement("button",{key:v,className:"p",onClick:()=>setSortBy(v),style:{flex:1,border:"none",cursor:"pointer",fontSize:"11px",fontWeight:sortBy===v?"700":"500",padding:"6px 0",borderRadius:"8px",background:sortBy===v?"rgba(255,255,255,0.95)":"transparent",color:sortBy===v?c.ink:"rgba(60,60,67,0.6)",boxShadow:sortBy===v?"0 1px 4px rgba(0,0,0,0.1)":"none"}},k2))),(()=>{let sk=sortBy==="cur"?x=>x.cur:sortBy==="best"?x=>x.best:x=>x.cnt,gs=(categories||[]).map(ct=>({ct,rows:mStats.filter(x=>(x.h.category||"general")===ct.id).sort((a,b)=>sk(b)-sk(a)||b.cnt-a.cnt)})).filter(g=>g.rows.length&&(selCat===null||selCat===g.ct.id));return gs.length?gs.map((g,gi)=>o.default.createElement("div",{key:g.ct.id,style:{marginBottom:gi===gs.length-1?0:"14px"}},o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"6px",marginBottom:"8px"}},o.default.createElement("span",{style:{width:"7px",height:"7px",borderRadius:"50%",background:g.ct.color||"#007aff",flexShrink:0,boxShadow:"0 0 6px "+(g.ct.color||"#007aff")+"88"}}),o.default.createElement("span",{style:{fontSize:"11px",fontWeight:"700",color:g.ct.color||"#007aff",letterSpacing:"0.02em"}},g.ct.label)),g.rows.map((x,i2)=>{let pctM=x.limit?Math.round(x.cnt/x.limit*100):0,dc=pctM>=70?["rgba(52,199,89,0.14)","#1e8e3e"]:pctM>=40?["rgba(255,149,0,0.14)","#b25e00"]:["rgba(60,60,67,0.08)","rgba(60,60,67,0.55)"];return o.default.createElement("div",{key:i2,style:{display:"flex",alignItems:"center",gap:"7px",marginBottom:i2===g.rows.length-1?0:"10px"}},o.default.createElement("span",{style:{fontSize:"16px",flexShrink:0}},x.h.emoji||"●"),o.default.createElement("span",{style:{flex:1,fontSize:"13px",fontWeight:"600",color:c.ink,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",minWidth:0}},x.h.name),o.default.createElement(InsPill,{icon:"\u{1F525}",text:x.cur+"d",bg:x.cur>0?"rgba(255,103,35,0.13)":"rgba(60,60,67,0.08)",fg:x.cur>0?"#e05a1a":"rgba(60,60,67,0.5)"}),o.default.createElement(InsPill,{icon:"\u{1F3C6}",text:x.best+"d",bg:"rgba(255,204,0,0.16)",fg:"#8a6a00"}),o.default.createElement(InsPill,{icon:"✓",text:x.cnt+"/"+x.limit,bg:dc[0],fg:dc[1]}))})))
+:o.default.createElement("div",{style:{fontSize:"12px",color:"rgba(60,60,67,0.5)"}},"No habits in this category")})()),S.catStats.length>1&&o.default.createElement(InsCard,{title:"By category · 30 days"},S.catStats.map((ct,i2)=>o.default.createElement("div",{key:i2,style:{display:"flex",alignItems:"center",gap:"10px",marginBottom:i2===S.catStats.length-1?0:"10px"}},o.default.createElement("span",{style:{width:"10px",height:"10px",borderRadius:"50%",background:ct.color||"#007aff",flexShrink:0}}),o.default.createElement("span",{style:{flex:1,fontSize:"13px",fontWeight:"600",color:c.ink}},ct.label,o.default.createElement("span",{style:{fontWeight:"400",color:"rgba(60,60,67,0.5)",fontSize:"11px"}}," · ",ct.n," habit",ct.n===1?"":"s")),o.default.createElement("div",{style:{width:"110px",height:"7px",borderRadius:"4px",background:"rgba(60,60,67,0.1)",overflow:"hidden",flexShrink:0}},o.default.createElement("div",{style:{width:ct.rate+"%",height:"100%",borderRadius:"4px",background:pctColor(ct.rate)}})),o.default.createElement("span",{style:{fontSize:"12px",fontWeight:"800",color:pctColor(ct.rate),minWidth:"36px",textAlign:"right"}},ct.rate,"%")))),o.default.createElement(InsCard,{title:"Patterns"},o.default.createElement(PatternsSection,{habits,checks,today})),o.default.createElement(InsCard,{title:"Year in review"},o.default.createElement("button",{className:"p",onClick:()=>setYrOpen(!0),style:{width:"100%",minHeight:"52px",display:"flex",alignItems:"center",gap:"12px",padding:"14px",border:"none",borderRadius:"14px",cursor:"pointer",fontFamily:"inherit",textAlign:"left",background:"linear-gradient(135deg,#af52de,#0a84ff)",color:"#fff",boxShadow:"0 6px 20px rgba(120,80,220,0.28)"}},o.default.createElement("span",{style:{fontSize:"20px",flexShrink:0}},"\u2728"),o.default.createElement("span",{style:{flex:1,minWidth:0}},o.default.createElement("span",{style:{display:"block",fontSize:"14.5px",fontWeight:"700"}},"Your year in Lifestyle"),o.default.createElement("span",{style:{display:"block",fontSize:"11.5px",opacity:.85,marginTop:"1px"}},"Everything you did this year, in one page")),o.default.createElement("svg",{width:"13",height:"13",viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:"2.4",strokeLinecap:"round",strokeLinejoin:"round",style:{flexShrink:0}},o.default.createElement("polyline",{points:"9 18 15 12 9 6"})))),yrOpen?o.default.createElement(YearReview,{habits,checks,today,onClose:()=>setYrOpen(!1)}):null,o.default.createElement(InsCard,{title:"Life summary"},o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"12px",marginBottom:"12px"}},o.default.createElement("span",{style:{fontSize:"20px"}},"\u{1F501}"),o.default.createElement("div",{style:{flex:1}},o.default.createElement("div",{style:{fontSize:"13px",fontWeight:"600",color:c.ink}},"Payments"),o.default.createElement("div",{style:{fontSize:"11px",color:"rgba(60,60,67,0.55)"}},S.bills.length?S.bills.length+" bill"+(S.bills.length===1?"":"s")+" · "+money(S.perYear)+"/yr · "+money(S.dueMonth)+" in "+D1[mo]:"No bills added yet")),S.bills.length?o.default.createElement("span",{style:{fontSize:"14px",fontWeight:"800",color:c.ink}},money(S.dueMonth)):null),o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"12px",marginBottom:"12px"}},o.default.createElement("span",{style:{fontSize:"20px"}},"\u{1F4B3}"),o.default.createElement("div",{style:{flex:1}},o.default.createElement("div",{style:{fontSize:"13px",fontWeight:"600",color:c.ink}},"Card bills"),o.default.createElement("div",{style:{fontSize:"11px",color:"rgba(60,60,67,0.55)"}},S.cardBills.length?S.cardBills.length+" statement"+(S.cardBills.length===1?"":"s")+" \u00b7 "+money(S.cardAllTot)+" tracked":"No statements added yet")),S.cardBills.length?o.default.createElement("span",{style:{fontSize:"14px",fontWeight:"800",color:c.ink}},money(S.cardLatestTot)):null),o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"12px",marginBottom:"12px"}},o.default.createElement("span",{style:{fontSize:"20px"}},"☑️"),o.default.createElement("div",{style:{flex:1}},o.default.createElement("div",{style:{fontSize:"13px",fontWeight:"600",color:c.ink}},"Tasks"),o.default.createElement("div",{style:{fontSize:"11px",color:"rgba(60,60,67,0.55)"}},S.pending+" pending"+(S.overdue?" · "+S.overdue+" overdue":"")+" · "+S.done30+" done in 30d")),S.overdue>0&&o.default.createElement("span",{style:{fontSize:"11px",fontWeight:"700",color:"#ff3b30",background:"rgba(255,59,48,0.12)",padding:"3px 8px",borderRadius:"8px"}},S.overdue," overdue")),o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"12px"}},o.default.createElement("span",{style:{fontSize:"20px"}},"\u{1F465}"),o.default.createElement("div",{style:{flex:1}},o.default.createElement("div",{style:{fontSize:"13px",fontWeight:"600",color:c.ink}},"People"),o.default.createElement("div",{style:{fontSize:"11px",color:"rgba(60,60,67,0.55)"}},S.people.length?S.people.length+" · "+S.dueP+" to reach out":"No people added yet")),S.dueP>0&&o.default.createElement("span",{style:{fontSize:"11px",fontWeight:"700",color:"#ff9500",background:"rgba(255,149,0,0.12)",padding:"3px 8px",borderRadius:"8px"}},S.dueP," due")),S.events.length>0&&o.default.createElement("div",{style:{marginTop:"12px",paddingTop:"12px",borderTop:"0.5px solid rgba(60,60,67,0.12)"}},o.default.createElement("div",{style:{fontSize:"10px",fontWeight:"700",color:"rgba(60,60,67,0.55)",textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:"8px"}},"Coming up"),S.events.slice(0,4).map((ev,i2)=>o.default.createElement("div",{key:i2,style:{display:"flex",alignItems:"center",gap:"8px",marginBottom:i2===Math.min(S.events.length,4)-1?0:"6px"}},o.default.createElement("span",{style:{fontSize:"15px"}},ev.icon),o.default.createElement("span",{style:{flex:1,fontSize:"12px",fontWeight:"600",color:c.ink}},ev.name),o.default.createElement("span",{style:{fontSize:"11px",fontWeight:"700",color:"#0A7CFF"}},ev.days===0?"Today!":ev.days===1?"Tomorrow":"in "+ev.days+"d")))))))}
 function Dy({habits:t,checks:e,today:l,yr:n,mo:a,days:i,isFuture:u,getDayPct:r,pctColor:f,getMonthScore:g,categories:y}){let[b,h]=(0,o.useState)("heatmap");return o.default.createElement("div",null,o.default.createElement("div",{style:{background:c.borderLt,borderRadius:"12px",padding:"3px",display:"flex",gap:"2px",marginBottom:"16px"}},[["heatmap","\u{1F525} Heatmap"],["report","\u{1F4CA} Report"]].map(([v,k])=>o.default.createElement("button",{key:v,className:"seg",onClick:()=>h(v),style:{background:b===v?"rgba(255,255,255,0.95)":"transparent",color:b===v?c.ink:"rgba(60,60,67,0.6)",boxShadow:b===v?"0 2px 8px rgba(0,0,0,0.12), 0 0.5px 1px rgba(0,0,0,0.08)":"none",fontWeight:b===v?"600":"400"}},k))),b==="heatmap"&&o.default.createElement(ty,{habits:t,checks:e,today:l,pctColor:f,categories:y}),b==="report"&&o.default.createElement(ey,{habits:t,checks:e,yr:n,mo:a,days:i,isFuture:u,getDayPct:r,pctColor:f,getMonthScore:g}))}function useKeyboardInset(){let[kb,setKb]=(0,o.useState)(0);return(0,o.useEffect)(()=>{let vv=window.visualViewport;if(!vv)return;let up=()=>{let inset=Math.max(0,window.innerHeight-vv.height-vv.offsetTop);setKb(inset>60?inset:0)};return vv.addEventListener("resize",up),vv.addEventListener("scroll",up),up(),()=>{vv.removeEventListener("resize",up),vv.removeEventListener("scroll",up)}},[]),kb}
 function kc({children:t,onClose:e,title:l}){useScrollLockWhen(!0);let dr=useSheetDrag(e),kb=useKeyboardInset();return o.default.createElement("div",{className:"modal-backdrop",style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.3)",zIndex:200,display:"flex",alignItems:"flex-end",justifyContent:"center",backdropFilter:"blur(8px)",WebkitBackdropFilter:"blur(8px)",paddingBottom:kb,transition:"padding-bottom 0.15s ease-out",boxSizing:"border-box"},onClick:e},o.default.createElement("div",{className:"modal-sheet",onTouchStart:dr.onTouchStart,onTouchMove:dr.onTouchMove,onTouchEnd:dr.onTouchEnd,onFocusCapture:w=>{let tg=w.target;/INPUT|TEXTAREA|SELECT/.test(tg.tagName)&&setTimeout(()=>{try{tg.scrollIntoView({block:"center",behavior:"smooth"})}catch(er){}},280)},style:{background:"rgba(255,255,255,0.75)",backdropFilter:"blur(40px) saturate(1.8)",WebkitBackdropFilter:"blur(40px) saturate(1.8)",borderRadius:"28px 28px 0 0",padding:"0 0 40px",width:"100%",maxWidth:"min(100%,720px)",maxHeight:kb?`calc(92vh - ${kb}px)`:"92vh",overflowY:"auto",border:"0.5px solid rgba(255,255,255,0.6)",borderBottom:"none",boxShadow:"0 -8px 40px rgba(31,38,135,0.15)",transform:dr.dy?`translateY(${dr.dy}px)`:void 0,transition:dr.dy?"none":"transform 0.25s cubic-bezier(0.4,0,0.2,1)"},onClick:n=>n.stopPropagation()},o.default.createElement("div",{style:{display:"flex",justifyContent:"center",padding:"12px 0 4px"}},o.default.createElement("div",{style:{width:"36px",height:"5px",borderRadius:"3px",background:"rgba(60,60,67,0.25)"}})),l&&o.default.createElement("div",{style:{fontSize:"20px",fontWeight:"700",color:c.ink,padding:"12px 20px 16px",letterSpacing:"-0.03em"}},l),o.default.createElement("div",{style:{padding:"0 16px"}},t)))}function wy({msg:t}){return o.default.createElement("div",{style:{position:"fixed",top:"80px",left:"50%",transform:"translateX(-50%)",background:c.ink,color:c.paper,padding:"10px 20px",borderRadius:"12px",fontSize:"14px",fontWeight:"500",zIndex:300,boxShadow:"0 4px 20px rgba(0,0,0,0.3)",whiteSpace:"nowrap"}},t)}function Ny(){return o.default.createElement("style",null,`
       *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
