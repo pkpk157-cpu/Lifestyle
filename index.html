@@ -1230,6 +1230,650 @@ function WeeklyReview({ habits, checks, today, onClose }) {
   );
 }
 
+// ---- spending data layer ---------------------------------------------------
+function merchKey(name) { return String(name || "").toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim(); }
+
+function readRules() { return lsGet(K_RULES, {}) || {}; }
+function setRule(merchant, category) {
+  var r = P({}, readRules());
+  if (category) r[merchKey(merchant)] = category; else delete r[merchKey(merchant)];
+  lsSet(K_RULES, r); storeEmit(K_RULES);
+}
+function categoryFor(merchant, fallback) {
+  var r = readRules()[merchKey(merchant)];
+  return r || fallback || "Uncategorised";
+}
+
+function readCash() { return lsGet(K_CASH, []) || []; }
+function writeCash(v) { lsSet(K_CASH, v); storeEmit(K_CASH); }
+
+function readBudgets() { return lsGet(K_BUDGET, {}) || {}; }
+function writeBudgets(v) { lsSet(K_BUDGET, v); storeEmit(K_BUDGET); }
+
+function readSplits() { return lsGet(K_SPLIT, {}) || {}; }
+function writeSplits(v) { lsSet(K_SPLIT, v); storeEmit(K_SPLIT); }
+function splitKey(stId, ix) { return String(stId) + ":" + ix; }
+
+function readCardMeta() { return lsGet(K_CARDMETA, {}) || {}; }
+function writeCardMeta(v) { lsSet(K_CARDMETA, v); storeEmit(K_CARDMETA); }
+function cardMetaFor(name) {
+  return readCardMeta()[merchKey(name)] || { fee: 0, waiverSpend: 0, waiverBy: "", rewardRate: 0, points: 0 };
+}
+function setCardMeta(name, patch) {
+  var all = P({}, readCardMeta());
+  all[merchKey(name)] = ot(P({}, cardMetaFor(name)), patch);
+  writeCardMeta(all);
+}
+
+// statement date "12-Aug-2026" -> "2026-08-12"
+function txIso(tx, stMonth) {
+  var m = /^(\d{2})-([A-Za-z]{3})-(\d{4})$/.exec(tx.date || "");
+  if (m) {
+    var mi = D1.findIndex(function (x) { return x.toLowerCase() === m[2].toLowerCase(); });
+    if (mi > -1) return m[3] + "-" + pad2(mi + 1) + "-" + m[1];
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(tx.date || "")) return tx.date;
+  return stMonth ? stMonth + "-01" : null;
+}
+
+// every spend across every statement plus manual cash entries
+function allSpends() {
+  var out = [];
+  readCardBills().forEach(function (st) {
+    (st.transactions || []).forEach(function (tx, ix) {
+      if (tx.credit) return;
+      var cm = cleanMerchant(tx.desc);
+      out.push({
+        merchant: cm.name, amount: Number(tx.amount) || 0,
+        iso: txIso(tx, st.month), month: st.month || "",
+        card: st.cardName || "", stId: st.id, ix: ix,
+        category: categoryFor(cm.name, tx.category), rawCategory: tx.category || "",
+        section: tx.section || "main", source: "card"
+      });
+    });
+  });
+  readCash().forEach(function (ch) {
+    out.push({
+      merchant: ch.merchant || "Cash", amount: Number(ch.amount) || 0,
+      iso: ch.date, month: (ch.date || "").slice(0, 7),
+      card: "Cash", stId: "cash", ix: ch.id,
+      category: categoryFor(ch.merchant, ch.category), rawCategory: ch.category || "",
+      section: "main", source: "cash"
+    });
+  });
+  return out;
+}
+
+function spendMonths() {
+  var set = {};
+  allSpends().forEach(function (s) { if (s.month) set[s.month] = 1; });
+  return Object.keys(set).sort().reverse();
+}
+function monthLabel(m) {
+  if (!m) return "";
+  var p = m.split("-");
+  return Mo[Number(p[1]) - 1] + " " + p[0];
+}
+
+function byCategory(spends) {
+  var map = {};
+  spends.forEach(function (s) { map[s.category] = (map[s.category] || 0) + s.amount; });
+  return Object.keys(map).map(function (k) { return { category: k, amount: map[k] }; })
+    .sort(function (a, b) { return b.amount - a.amount; });
+}
+function byMerchant(spends) {
+  var map = {};
+  spends.forEach(function (s) {
+    if (!map[s.merchant]) map[s.merchant] = { merchant: s.merchant, amount: 0, count: 0, category: s.category };
+    map[s.merchant].amount += s.amount; map[s.merchant].count++;
+  });
+  return Object.keys(map).map(function (k) { return map[k]; })
+    .sort(function (a, b) { return b.amount - a.amount; });
+}
+
+// merchants seen this month that were not in any earlier month
+function newMerchants(month) {
+  var all = allSpends();
+  var here = {}, before = {};
+  all.forEach(function (s) {
+    if (s.month === month) here[s.merchant] = (here[s.merchant] || 0) + s.amount;
+    else if (s.month && s.month < month) before[s.merchant] = 1;
+  });
+  return Object.keys(here).filter(function (m) { return !before[m]; })
+    .map(function (m) { return { merchant: m, amount: here[m] }; })
+    .sort(function (a, b) { return b.amount - a.amount; });
+}
+
+// ---- annual fee waiver -----------------------------------------------------
+// Spend counted from the start of the card's fee year up to the waiver date.
+function waiverProgress(cardName, today) {
+  var meta = cardMetaFor(cardName);
+  if (!meta.waiverSpend || !meta.waiverBy) return null;
+  var end = new Date(meta.waiverBy + "T00:00:00");
+  if (isNaN(end)) return null;
+  var start = new Date(end.getFullYear() - 1, end.getMonth(), end.getDate());
+  var spent = 0;
+  allSpends().forEach(function (s) {
+    if (merchKey(s.card) !== merchKey(cardName)) return;
+    if (!s.iso) return;
+    var d = new Date(s.iso + "T00:00:00");
+    if (d >= start && d <= end) spent += s.amount;
+  });
+  var need = Math.max(0, meta.waiverSpend - spent);
+  var days = daysUntil(meta.waiverBy, today);
+  return {
+    spent: spent, target: meta.waiverSpend, need: need, fee: meta.fee,
+    pct: Math.min(100, Math.round(spent / meta.waiverSpend * 100)),
+    days: days, by: meta.waiverBy, done: spent >= meta.waiverSpend
+  };
+}
+
+// ---- cash-flow forecast ----------------------------------------------------
+function forecast(today) {
+  var out = { bills: 0, cards: 0, items: [] };
+  readBills().forEach(function (b) {
+    if (!b.dueDate) return;
+    var dd = b.dueDate, g = 0;
+    while (daysUntil(dd, today) < 0 && g < 600) { dd = py(dd, b.frequency || "monthly"); g++; }
+    var d = daysUntil(dd, today);
+    if (d !== null && d <= 30) {
+      out.bills += Number(b.amount) || 0;
+      out.items.push({ name: b.name, amount: Number(b.amount) || 0, d: d, kind: "bill", autopay: b.autopay });
+    }
+  });
+  readCardBills().forEach(function (cb) {
+    if (cb.paid || !cb.dueDate) return;
+    var d = daysUntil(cb.dueDate, today);
+    if (d !== null && d <= 30) {
+      out.cards += Number(cb.total) || 0;
+      out.items.push({ name: (cb.cardName || "Card") + " bill", amount: Number(cb.total) || 0, d: d, kind: "card" });
+    }
+  });
+  out.items.sort(function (a, b) { return a.d - b.d; });
+  out.total = out.bills + out.cards;
+  return out;
+}
+
+// ---- merchant timeline sheet -----------------------------------------------
+function MerchantSheet({ merchant, today, onClose, onSplit }) {
+  var rows = allSpends().filter(function (s) { return s.merchant === merchant; })
+    .sort(function (a, b) { return String(b.iso || "").localeCompare(String(a.iso || "")); });
+  var total = rows.reduce(function (a, b) { return a + b.amount; }, 0);
+  var months = {};
+  rows.forEach(function (r) { if (r.month) months[r.month] = (months[r.month] || 0) + r.amount; });
+  var mk = Object.keys(months).sort();
+  var perMonth = mk.length ? Math.round(total / mk.length) : 0;
+  var first = rows.length ? rows[rows.length - 1] : null;
+  var brand = hy(merchant) || vy(merchant);
+  var cats = ["Food", "Travel", "Shopping", "Groceries", "Fuel", "Bills", "Health", "Entertainment", "Cash", "Other"];
+  var curCat = categoryFor(merchant, rows.length ? rows[0].rawCategory : "");
+  var cs = (0, o.useState)(curCat), cat = cs[0], setCat = cs[1];
+  var maxM = Math.max.apply(null, mk.map(function (k) { return months[k]; }).concat([1]));
+
+  return o.default.createElement(MSheet, { title: merchant, onClose: onClose },
+    o.default.createElement("div", { style: { display: "flex", alignItems: "center", gap: "12px", marginBottom: "16px" } },
+      o.default.createElement("div", {
+        style: {
+          width: "46px", height: "46px", borderRadius: "14px", background: brand.bg, color: brand.fg,
+          display: "flex", alignItems: "center", justifyContent: "center", fontSize: "19px", fontWeight: "800", flexShrink: 0
+        }
+      }, brand.mark),
+      o.default.createElement("div", { style: { flex: 1, minWidth: 0 } },
+        o.default.createElement("div", { style: { fontSize: "23px", fontWeight: "800", color: c.ink, letterSpacing: "-0.03em" } }, fmtINR(total)),
+        o.default.createElement("div", { style: { fontSize: "12px", color: c.inkFaint, marginTop: "1px" } },
+          rows.length + " charge" + (rows.length === 1 ? "" : "s") +
+          (mk.length > 1 ? " · about " + fmtINR(perMonth) + "/mo" : "")))),
+
+    mk.length > 1 ? o.default.createElement("div", { style: { marginBottom: "18px" } },
+      o.default.createElement(MSectionLabel, null, "By month"),
+      o.default.createElement("div", { style: { display: "flex", gap: "5px", alignItems: "flex-end", height: "70px" } },
+        mk.slice(-12).map(function (k) {
+          return o.default.createElement("div", { key: k, style: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: "4px" } },
+            o.default.createElement("div", { style: { flex: 1, width: "100%", display: "flex", alignItems: "flex-end" } },
+              o.default.createElement("div", {
+                title: fmtINR(months[k]),
+                style: { width: "100%", height: Math.max(4, months[k] / maxM * 100) + "%", borderRadius: "5px", background: "linear-gradient(180deg,#0a84ff,#0066d6)" }
+              })),
+            o.default.createElement("div", { style: { fontSize: "8.5px", fontWeight: "700", color: c.inkFaint } }, D1[Number(k.split("-")[1]) - 1]));
+        }))) : null,
+
+    o.default.createElement(MChips, {
+      label: "Category — remembered for future statements",
+      options: cats.map(function (x) { return { id: x, label: x }; }),
+      value: cat,
+      onChange: function (v) { setCat(v); setRule(merchant, v); }
+    }),
+
+    first && first.iso ? o.default.createElement("div", { style: { fontSize: "12px", color: c.inkFaint, marginBottom: "14px" } },
+      "First seen " + keyToLabel(isoToKey(first.iso))) : null,
+
+    o.default.createElement(MSectionLabel, null, "Every charge"),
+    rows.map(function (r, i) {
+      return o.default.createElement("div", {
+        key: i,
+        style: { display: "flex", alignItems: "center", gap: "10px", padding: "10px 0", borderBottom: "0.5px solid " + c.borderLt }
+      },
+        o.default.createElement("div", { style: { flex: 1, minWidth: 0 } },
+          o.default.createElement("div", { style: { fontSize: "13px", color: c.ink } }, r.iso ? keyToLabel(isoToKey(r.iso)) : r.month),
+          o.default.createElement("div", { style: { fontSize: "10.5px", color: c.inkFaint, marginTop: "1px" } },
+            r.card + (r.section === "addon" ? " · add-on" : ""))),
+        o.default.createElement("div", { style: { fontSize: "14px", fontWeight: "700", color: c.ink, flexShrink: 0 } }, fmtINR(r.amount)),
+        onSplit && r.source === "card" ? o.default.createElement("button", {
+          className: "p", title: "Split with someone", onClick: function () { onSplit(r); },
+          style: { border: "1px solid " + c.border, borderRadius: "999px", padding: "5px 10px", background: "transparent", color: c.blue, fontSize: "11px", fontWeight: "700", cursor: "pointer", flexShrink: 0, fontFamily: "inherit" }
+        }, "Split") : null);
+    })
+  );
+}
+
+// ---- split a charge across people ------------------------------------------
+function SplitSheet({ spend, onClose }) {
+  var people = readPeople();
+  var key = splitKey(spend.stId, spend.ix);
+  var existing = readSplits()[key] || [];
+  var ss = (0, o.useState)(function () { return existing.map(function (x) { return x.personId; }); });
+  var picked = ss[0], setPicked = ss[1];
+  var n = picked.length + 1; // you plus everyone picked
+  var share = n ? Math.round(spend.amount / n) : spend.amount;
+
+  var save = function () {
+    var all = P({}, readSplits());
+    if (picked.length) all[key] = picked.map(function (id) { return { personId: id, share: share }; });
+    else delete all[key];
+    writeSplits(all);
+    onClose();
+  };
+
+  return o.default.createElement(MSheet, {
+    title: "Split " + fmtINR(spend.amount), onClose: onClose, onSave: save, canSave: true, saveLabel: "Save"
+  },
+    o.default.createElement("div", { style: { fontSize: "13px", color: c.inkFaint, marginBottom: "14px", lineHeight: 1.5 } },
+      spend.merchant + (spend.iso ? " · " + keyToLabel(isoToKey(spend.iso)) : "")),
+    people.length === 0
+      ? o.default.createElement("div", { style: { fontSize: "13px", color: c.inkFaint } }, "Add people in the People tab first.")
+      : o.default.createElement(o.default.Fragment, null,
+        o.default.createElement("div", {
+          style: { background: c.bg, borderRadius: "14px", padding: "14px", marginBottom: "16px", textAlign: "center" }
+        },
+          o.default.createElement("div", { style: { fontSize: "24px", fontWeight: "800", color: c.ink, letterSpacing: "-0.03em" } }, fmtINR(share)),
+          o.default.createElement("div", { style: { fontSize: "11.5px", color: c.inkFaint, marginTop: "2px", fontWeight: "600" } },
+            "each, split " + n + " way" + (n === 1 ? "" : "s"))),
+        o.default.createElement(MSectionLabel, null, "Split with"),
+        people.map(function (p) {
+          var on = picked.indexOf(p.id) > -1;
+          return o.default.createElement("button", {
+            key: p.id, className: "p",
+            onClick: function () { setPicked(on ? picked.filter(function (x) { return x !== p.id; }) : picked.concat([p.id])); },
+            style: {
+              width: "100%", display: "flex", alignItems: "center", gap: "11px", padding: "11px 10px",
+              marginBottom: "7px", border: "1px solid " + (on ? c.blue : c.border), borderRadius: "13px",
+              background: on ? c.blueBg : "transparent", cursor: "pointer", textAlign: "left", fontFamily: "inherit"
+            }
+          },
+            o.default.createElement("span", {
+              style: {
+                width: "30px", height: "30px", borderRadius: "50%", background: on ? c.blue : c.bg,
+                color: on ? "#fff" : c.inkMid, display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: "12px", fontWeight: "700", flexShrink: 0
+              }
+            }, String(p.name || "?").slice(0, 1).toUpperCase()),
+            o.default.createElement("span", { style: { flex: 1, minWidth: 0, fontSize: "14px", color: c.ink } }, p.name),
+            on ? o.default.createElement("span", { style: { color: c.blue, fontWeight: "800", fontSize: "14px" } }, "✓") : null);
+        }))
+  );
+}
+
+// ---- budgets ---------------------------------------------------------------
+function BudgetSheet({ month, onClose }) {
+  var bs = (0, o.useState)(function () { return P({}, readBudgets()); }), draft = bs[0], setDraft = bs[1];
+  var spends = allSpends().filter(function (s) { return s.month === month; });
+  var cats = byCategory(spends);
+  var known = {};
+  cats.forEach(function (x) { known[x.category] = x.amount; });
+  Object.keys(draft).forEach(function (k) { if (!(k in known)) known[k] = 0; });
+  var list = Object.keys(known).sort(function (a, b) { return known[b] - known[a]; });
+
+  return o.default.createElement(MSheet, {
+    title: "Budgets", onClose: onClose, saveLabel: "Save", canSave: true,
+    onSave: function () { writeBudgets(draft); onClose(); }
+  },
+    o.default.createElement("div", { style: { fontSize: "12.5px", color: c.inkFaint, marginBottom: "16px", lineHeight: 1.5 } },
+      "A monthly cap per category. Leave blank for no cap. Spend shown is " + monthLabel(month) + "."),
+    list.map(function (k) {
+      var spent = known[k], cap = Number(draft[k]) || 0;
+      var pct = cap ? Math.min(100, Math.round(spent / cap * 100)) : 0;
+      var over = cap && spent > cap;
+      return o.default.createElement("div", { key: k, style: { marginBottom: "16px" } },
+        o.default.createElement("div", { style: { display: "flex", alignItems: "baseline", gap: "8px", marginBottom: "6px" } },
+          o.default.createElement("div", { style: { flex: 1, minWidth: 0, fontSize: "14px", fontWeight: "600", color: c.ink } }, k),
+          o.default.createElement("div", { style: { fontSize: "12px", color: over ? c.red : c.inkFaint, fontWeight: "600" } },
+            fmtINR(spent) + (cap ? " of " + fmtINR(cap) : ""))),
+        cap ? o.default.createElement("div", { style: { height: "6px", borderRadius: "3px", background: c.borderLt, overflow: "hidden", marginBottom: "8px" } },
+          o.default.createElement("div", {
+            style: {
+              width: pct + "%", height: "100%", borderRadius: "3px",
+              background: over ? "#ff3b30" : pct >= 90 ? "#ff9500" : "linear-gradient(90deg,#30d158,#1fa847)"
+            }
+          })) : null,
+        o.default.createElement(MField, {
+          label: "Monthly cap", type: "number", inputMode: "decimal", prefix: "₹",
+          value: draft[k] === undefined ? "" : draft[k],
+          onChange: function (v) {
+            var nx = P({}, draft);
+            if (v === "" || Number(v) <= 0) delete nx[k]; else nx[k] = Number(v);
+            setDraft(nx);
+          }
+        }));
+    }),
+    list.length === 0 ? o.default.createElement("div", { style: { fontSize: "13px", color: c.inkFaint } },
+      "Upload a card statement or log a cash spend first — categories appear here once there is something to budget.") : null
+  );
+}
+
+// ---- manual / cash spend ---------------------------------------------------
+function CashSheet({ today, editing, onClose }) {
+  var e0 = editing || {};
+  var ms = (0, o.useState)(e0.merchant || ""), merch = ms[0], setMerch = ms[1];
+  var as = (0, o.useState)(e0.amount === undefined ? "" : String(e0.amount)), amt = as[0], setAmt = as[1];
+  var ds = (0, o.useState)(e0.date || isoDay(0, today)), date = ds[0], setDate = ds[1];
+  var cs = (0, o.useState)(e0.category || "Cash"), cat = cs[0], setCat = cs[1];
+  var ns = (0, o.useState)(e0.note || ""), note = ns[0], setNote = ns[1];
+  var cats = ["Food", "Travel", "Shopping", "Groceries", "Fuel", "Bills", "Health", "Entertainment", "Cash", "Other"];
+
+  var save = function () {
+    var row = {
+      id: e0.id || Date.now(), merchant: merch.trim() || "Cash",
+      amount: Number(amt) || 0, date: date, category: cat, note: note.trim()
+    };
+    var cur = readCash();
+    writeCash(e0.id ? cur.map(function (x) { return x.id === e0.id ? row : x; }) : [row].concat(cur));
+    onClose();
+  };
+
+  return o.default.createElement(MSheet, {
+    title: e0.id ? "Edit spend" : "Log a spend", onClose: onClose, onSave: save,
+    canSave: !!(merch.trim() && Number(amt) > 0), saveLabel: "Save"
+  },
+    o.default.createElement("div", { style: { fontSize: "12.5px", color: c.inkFaint, marginBottom: "14px", lineHeight: 1.5 } },
+      "Cash, UPI, anything that will not show up on a card statement — so the month's total is real."),
+    o.default.createElement(MField, { label: "Where", value: merch, onChange: setMerch, autoFocus: true, placeholder: "e.g. Auto to work" }),
+    o.default.createElement(MPair, null,
+      o.default.createElement(MField, { label: "Amount", type: "number", inputMode: "decimal", prefix: "₹", value: amt, onChange: setAmt }),
+      o.default.createElement(MField, { label: "Date", type: "date", value: date, onChange: setDate })),
+    o.default.createElement(MChips, { label: "Category", options: cats.map(function (x) { return { id: x, label: x }; }), value: cat, onChange: setCat }),
+    o.default.createElement(MField, { label: "Note (optional)", value: note, onChange: setNote, multiline: true })
+  );
+}
+
+// ---- card meta (annual fee + rewards) --------------------------------------
+function CardMetaSheet({ cardName, today, onClose }) {
+  var m0 = cardMetaFor(cardName);
+  var f = (0, o.useState)(m0.fee ? String(m0.fee) : ""), fee = f[0], setFee = f[1];
+  var w = (0, o.useState)(m0.waiverSpend ? String(m0.waiverSpend) : ""), wSpend = w[0], setWSpend = w[1];
+  var b = (0, o.useState)(m0.waiverBy || ""), wBy = b[0], setWBy = b[1];
+  var r = (0, o.useState)(m0.rewardRate ? String(m0.rewardRate) : ""), rate = r[0], setRate = r[1];
+  var p = (0, o.useState)(m0.points ? String(m0.points) : ""), pts = p[0], setPts = p[1];
+
+  var save = function () {
+    setCardMeta(cardName, {
+      fee: Number(fee) || 0, waiverSpend: Number(wSpend) || 0, waiverBy: wBy || "",
+      rewardRate: Number(rate) || 0, points: Number(pts) || 0
+    });
+    onClose();
+  };
+
+  return o.default.createElement(MSheet, { title: cardName, onClose: onClose, onSave: save, canSave: true, saveLabel: "Save" },
+    o.default.createElement(MSectionLabel, null, "Annual fee waiver"),
+    o.default.createElement("div", { style: { fontSize: "12.5px", color: c.inkFaint, marginBottom: "14px", lineHeight: 1.5 } },
+      "Most premium cards waive the fee once you spend enough in a card year. Enter the target and the app tracks how close you are from your own statements."),
+    o.default.createElement(MPair, null,
+      o.default.createElement(MField, { label: "Annual fee", type: "number", inputMode: "decimal", prefix: "₹", value: fee, onChange: setFee }),
+      o.default.createElement(MField, { label: "Spend to waive", type: "number", inputMode: "decimal", prefix: "₹", value: wSpend, onChange: setWSpend })),
+    o.default.createElement(MField, {
+      label: "Waiver deadline", type: "date", value: wBy, onChange: setWBy,
+      suffix: wBy ? MClearBtn(function () { setWBy(""); }) : null
+    }),
+    o.default.createElement("div", { style: { height: "10px" } }),
+    o.default.createElement(MSectionLabel, null, "Rewards"),
+    o.default.createElement(MPair, null,
+      o.default.createElement(MField, { label: "Points per ₹100", type: "number", inputMode: "decimal", value: rate, onChange: setRate }),
+      o.default.createElement(MField, { label: "Points balance", type: "number", inputMode: "numeric", value: pts, onChange: setPts }))
+  );
+}
+
+// ---- fee-waiver progress card ----------------------------------------------
+function WaiverCard({ cardName, today, onEdit }) {
+  var w = waiverProgress(cardName, today);
+  var meta = cardMetaFor(cardName);
+  if (!w) {
+    return o.default.createElement("button", {
+      className: "p", onClick: onEdit,
+      style: {
+        width: "100%", minHeight: "46px", padding: "12px 14px", marginBottom: "10px", textAlign: "left",
+        border: "1px dashed " + c.border, borderRadius: "14px", background: "transparent",
+        color: c.blue, fontSize: "12.5px", fontWeight: "600", cursor: "pointer", fontFamily: "inherit"
+      }
+    }, "+ Track annual fee & rewards for " + cardName);
+  }
+  var tint = w.done ? "#1e8e3e" : w.days !== null && w.days < 45 ? "#c77700" : "#0a7cff";
+  return o.default.createElement("div", {
+    className: "p", onClick: onEdit,
+    style: {
+      background: "rgba(255,255,255,0.55)", borderRadius: "16px", padding: "13px 14px", marginBottom: "10px",
+      border: "0.5px solid rgba(255,255,255,0.6)", cursor: "pointer",
+      backdropFilter: "blur(20px) saturate(1.8)", WebkitBackdropFilter: "blur(20px) saturate(1.8)"
+    }
+  },
+    o.default.createElement("div", { style: { display: "flex", alignItems: "baseline", gap: "8px", marginBottom: "8px" } },
+      o.default.createElement("div", { style: { flex: 1, minWidth: 0, fontSize: "10px", fontWeight: "700", color: c.inkFaint, textTransform: "uppercase", letterSpacing: "0.05em" } },
+        "Fee waiver · " + cardName),
+      meta.points ? o.default.createElement("div", { style: { fontSize: "11px", fontWeight: "700", color: "#b26a00" } }, meta.points.toLocaleString("en-IN") + " pts") : null),
+    o.default.createElement("div", { style: { height: "8px", borderRadius: "4px", background: c.borderLt, overflow: "hidden", marginBottom: "8px" } },
+      o.default.createElement("div", {
+        style: {
+          width: w.pct + "%", height: "100%", borderRadius: "4px",
+          background: w.done ? "linear-gradient(90deg,#30d158,#1fa847)" : "linear-gradient(90deg,#0a84ff,#0066d6)",
+          transition: "width .4s"
+        }
+      })),
+    o.default.createElement("div", { style: { fontSize: "13px", color: c.ink, lineHeight: 1.45 } },
+      w.done
+        ? "Waived — you passed " + fmtINR(w.target) + "."
+        : o.default.createElement(o.default.Fragment, null,
+          "Spend ", o.default.createElement("b", { style: { color: tint } }, fmtINR(w.need)), " more",
+          w.days !== null ? " by " + keyToLabel(isoToKey(w.by)) + " (" + w.days + " days)" : "",
+          w.fee ? " to save the " + fmtINR(w.fee) + " fee." : ".")));
+}
+
+// ---- Spending sub-tab ------------------------------------------------------
+function SpendingTab({ today, addTick }) {
+  useLocal(K_CASH, []); useLocal(K_BUDGET, {}); useLocal(K_RULES, {}); useLocal(K_SPLIT, {});
+  var months = spendMonths();
+  var mS = (0, o.useState)(function () { return months[0] || isoDay(0, today).slice(0, 7); });
+  var month = mS[0], setMonth = mS[1];
+  var uiS = (0, o.useState)(null), sheet = uiS[0], setSheet = uiS[1];
+  (0, o.useEffect)(function () { if (addTick) setSheet({ t: "cash" }); }, [addTick]);
+
+  var all = allSpends();
+  var spends = all.filter(function (s) { return s.month === month; });
+  var prevMonth = (function () {
+    var p = month.split("-"); var d = new Date(Number(p[0]), Number(p[1]) - 2, 1);
+    return d.getFullYear() + "-" + pad2(d.getMonth() + 1);
+  })();
+  var prevSpends = all.filter(function (s) { return s.month === prevMonth; });
+  var total = spends.reduce(function (a, b) { return a + b.amount; }, 0);
+  var prevTotal = prevSpends.reduce(function (a, b) { return a + b.amount; }, 0);
+  var diff = prevTotal >= 1000 ? Math.round((total - prevTotal) / prevTotal * 100) : null;
+  var absDiff = prevSpends.length && prevTotal < 1000 ? total - prevTotal : null;
+
+  var cats = byCategory(spends);
+  var merchants = byMerchant(spends);
+  var budgets = readBudgets();
+  var fc = forecast(today);
+  var fresh = newMerchants(month);
+  var cashRows = readCash().filter(function (ch) { return (ch.date || "").slice(0, 7) === month; })
+    .sort(function (a, b) { return String(b.date).localeCompare(String(a.date)); });
+
+  var overBudget = cats.filter(function (x) { return budgets[x.category] && x.amount > budgets[x.category]; });
+
+  var card = function (children, extra) {
+    return o.default.createElement("div", {
+      style: ot(P({
+        background: "rgba(255,255,255,0.55)", borderRadius: "18px", padding: "14px", marginBottom: "12px",
+        border: "0.5px solid rgba(255,255,255,0.6)",
+        boxShadow: "0 6px 24px rgba(31,38,135,0.05), inset 0 1px 0 rgba(255,255,255,0.5)",
+        backdropFilter: "blur(24px) saturate(1.8)", WebkitBackdropFilter: "blur(24px) saturate(1.8)"
+      }), extra || {})
+    }, children);
+  };
+  var lbl = function (txt, action) {
+    return o.default.createElement("div", { style: { display: "flex", alignItems: "center", gap: "8px", marginBottom: "10px" } },
+      o.default.createElement("div", { style: { flex: 1, minWidth: 0, fontSize: "10px", fontWeight: "700", color: c.inkFaint, textTransform: "uppercase", letterSpacing: "0.05em" } }, txt),
+      action || null);
+  };
+  var linkBtn = function (text, onClick) {
+    return o.default.createElement("button", {
+      className: "p", onClick: onClick,
+      style: { border: "none", background: "transparent", color: c.blue, fontSize: "12px", fontWeight: "700", cursor: "pointer", padding: "4px 2px", fontFamily: "inherit", flexShrink: 0 }
+    }, text);
+  };
+
+  return o.default.createElement("div", null,
+
+    // month picker
+    months.length > 1 ? o.default.createElement("div", {
+      style: { display: "flex", gap: "6px", overflowX: "auto", marginBottom: "12px", paddingBottom: "2px", WebkitOverflowScrolling: "touch" }
+    },
+      months.slice(0, 14).map(function (m) {
+        var on = m === month;
+        return o.default.createElement("button", {
+          key: m, className: "p", onClick: function () { setMonth(m); },
+          style: {
+            padding: "7px 13px", borderRadius: "12px", border: "none", cursor: "pointer", fontSize: "12px",
+            fontWeight: "600", whiteSpace: "nowrap", flexShrink: 0, minHeight: "32px", fontFamily: "inherit",
+            background: on ? c.blue : c.borderLt, color: on ? c.paper : c.inkMid
+          }
+        }, monthLabel(m));
+      })) : null,
+
+    // headline
+    card(o.default.createElement(o.default.Fragment, null,
+      o.default.createElement("div", { style: { fontSize: "10px", fontWeight: "700", color: c.inkFaint, textTransform: "uppercase", letterSpacing: "0.05em" } },
+        "Spent in " + monthLabel(month)),
+      o.default.createElement("div", { style: { fontSize: "31px", fontWeight: "800", color: c.ink, letterSpacing: "-0.04em", marginTop: "3px" } },
+        o.default.createElement(CountUp, { v: Math.round(total), fmt: fmtINR })),
+      diff !== null ? o.default.createElement("div", {
+        style: { fontSize: "12.5px", fontWeight: "600", marginTop: "3px", color: diff > 0 ? c.red : diff < 0 ? "#1e8e3e" : c.inkFaint }
+      }, diff === 0 ? "Same as " + monthLabel(prevMonth) : (diff > 0 ? "↑ " : "↓ ") + Math.abs(diff) + "% vs " + monthLabel(prevMonth))
+        : absDiff !== null ? o.default.createElement("div", {
+          style: { fontSize: "12.5px", fontWeight: "600", marginTop: "3px", color: absDiff > 0 ? c.red : "#1e8e3e" }
+        }, (absDiff > 0 ? "↑ " : "↓ ") + fmtINR(Math.abs(absDiff)) + " vs " + monthLabel(prevMonth)) : null,
+      overBudget.length ? o.default.createElement("div", {
+        style: { marginTop: "10px", padding: "9px 11px", borderRadius: "11px", background: "rgba(255,59,48,0.10)", fontSize: "12.5px", color: "#c0271e", fontWeight: "600" }
+      }, "Over budget in " + overBudget.map(function (x) { return x.category; }).join(", ")) : null)),
+
+    // forecast
+    fc.items.length ? card(o.default.createElement(o.default.Fragment, null,
+      lbl("Coming out in the next 30 days"),
+      o.default.createElement("div", { style: { fontSize: "26px", fontWeight: "800", color: c.ink, letterSpacing: "-0.03em", marginBottom: "8px" } }, fmtINR(fc.total)),
+      fc.items.slice(0, 5).map(function (it, i) {
+        return o.default.createElement("div", { key: i, style: { display: "flex", alignItems: "center", gap: "9px", padding: "5px 0" } },
+          o.default.createElement("span", { style: { fontSize: "13px", flexShrink: 0 } }, it.kind === "card" ? "💳" : "🧾"),
+          o.default.createElement("span", { style: { flex: 1, minWidth: 0, fontSize: "13px", color: c.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, it.name),
+          o.default.createElement("span", { style: { fontSize: "11px", color: c.inkFaint, flexShrink: 0 } }, it.d === 0 ? "today" : it.d + "d"),
+          o.default.createElement("span", { style: { fontSize: "13px", fontWeight: "700", color: c.ink, flexShrink: 0 } }, fmtINR(it.amount)));
+      }))) : null,
+
+    // budgets
+    card(o.default.createElement(o.default.Fragment, null,
+      lbl("Budgets", linkBtn(Object.keys(budgets).length ? "Edit" : "Set up", function () { setSheet({ t: "budget" }); })),
+      cats.length === 0
+        ? o.default.createElement("div", { style: { fontSize: "12.5px", color: c.inkFaint } }, "Nothing spent in " + monthLabel(month) + " yet.")
+        : cats.slice(0, 8).map(function (x) {
+          var cap = budgets[x.category] || 0;
+          var pct = cap ? Math.min(100, Math.round(x.amount / cap * 100)) : 0;
+          var over = cap && x.amount > cap;
+          return o.default.createElement("div", { key: x.category, style: { marginBottom: "11px" } },
+            o.default.createElement("div", { style: { display: "flex", alignItems: "baseline", gap: "8px", marginBottom: "4px" } },
+              o.default.createElement("div", { style: { flex: 1, minWidth: 0, fontSize: "13px", color: c.ink, fontWeight: "500", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, x.category),
+              o.default.createElement("div", { style: { fontSize: "12.5px", fontWeight: "700", color: over ? c.red : c.ink, flexShrink: 0 } }, fmtINR(x.amount)),
+              cap ? o.default.createElement("div", { style: { fontSize: "10.5px", color: c.inkFaint, flexShrink: 0 } }, "/ " + fmtINR(cap)) : null),
+            o.default.createElement("div", { style: { height: "5px", borderRadius: "3px", background: c.borderLt, overflow: "hidden" } },
+              o.default.createElement("div", {
+                style: {
+                  width: (cap ? pct : Math.round(x.amount / (cats[0].amount || 1) * 100)) + "%", height: "100%", borderRadius: "3px",
+                  background: !cap ? "rgba(60,60,67,0.28)" : over ? "#ff3b30" : pct >= 90 ? "#ff9500" : "linear-gradient(90deg,#30d158,#1fa847)"
+                }
+              })));
+        }))),
+
+    // merchants
+    merchants.length ? card(o.default.createElement(o.default.Fragment, null,
+      lbl("Where it went"),
+      merchants.slice(0, 10).map(function (m) {
+        var brand = hy(m.merchant) || vy(m.merchant);
+        return o.default.createElement("button", {
+          key: m.merchant, className: "p", onClick: function () { setSheet({ t: "merchant", merchant: m.merchant }); },
+          style: {
+            width: "100%", display: "flex", alignItems: "center", gap: "10px", padding: "8px 2px",
+            border: "none", background: "transparent", cursor: "pointer", textAlign: "left", fontFamily: "inherit", minHeight: "44px"
+          }
+        },
+          o.default.createElement("span", {
+            style: {
+              width: "30px", height: "30px", borderRadius: "9px", background: brand.bg, color: brand.fg, flexShrink: 0,
+              display: "flex", alignItems: "center", justifyContent: "center", fontSize: "12px", fontWeight: "800"
+            }
+          }, brand.mark),
+          o.default.createElement("span", { style: { flex: 1, minWidth: 0 } },
+            o.default.createElement("span", { style: { display: "block", fontSize: "13.5px", color: c.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, m.merchant),
+            o.default.createElement("span", { style: { display: "block", fontSize: "10.5px", color: c.inkFaint, marginTop: "1px" } }, m.category + " · " + m.count + "×")),
+          o.default.createElement("span", { style: { fontSize: "13.5px", fontWeight: "700", color: c.ink, flexShrink: 0 } }, fmtINR(m.amount)));
+      }))) : null,
+
+    // new this month
+    fresh.length ? card(o.default.createElement(o.default.Fragment, null,
+      lbl("New this month"),
+      o.default.createElement("div", { style: { fontSize: "12px", color: c.inkFaint, marginBottom: "8px", marginTop: "-4px" } },
+        "Merchants that never appeared before " + monthLabel(month) + "."),
+      fresh.slice(0, 6).map(function (x) {
+        return o.default.createElement("div", { key: x.merchant, style: { display: "flex", alignItems: "center", gap: "9px", padding: "5px 0" } },
+          o.default.createElement("span", { style: { flex: 1, minWidth: 0, fontSize: "13px", color: c.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, x.merchant),
+          o.default.createElement("span", { style: { fontSize: "13px", fontWeight: "700", color: c.ink, flexShrink: 0 } }, fmtINR(x.amount)));
+      }))) : null,
+
+    // cash
+    card(o.default.createElement(o.default.Fragment, null,
+      lbl("Cash & manual", linkBtn("+ Log", function () { setSheet({ t: "cash" }); })),
+      cashRows.length === 0
+        ? o.default.createElement("div", { style: { fontSize: "12.5px", color: c.inkFaint, lineHeight: 1.5 } },
+          "A card statement is not your whole month. Log cash and UPI here so the totals are real.")
+        : cashRows.map(function (ch) {
+          return o.default.createElement("button", {
+            key: ch.id, className: "p", onClick: function () { setSheet({ t: "cash", editing: ch }); },
+            style: {
+              width: "100%", display: "flex", alignItems: "center", gap: "10px", padding: "8px 2px", minHeight: "44px",
+              border: "none", background: "transparent", cursor: "pointer", textAlign: "left", fontFamily: "inherit"
+            }
+          },
+            o.default.createElement("span", { style: { flex: 1, minWidth: 0 } },
+              o.default.createElement("span", { style: { display: "block", fontSize: "13.5px", color: c.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, ch.merchant),
+              o.default.createElement("span", { style: { display: "block", fontSize: "10.5px", color: c.inkFaint, marginTop: "1px" } },
+                ch.category + " · " + keyToLabel(isoToKey(ch.date)))),
+            o.default.createElement("span", { style: { fontSize: "13.5px", fontWeight: "700", color: c.ink, flexShrink: 0 } }, fmtINR(ch.amount)));
+        }))),
+
+    sheet && sheet.t === "budget" ? o.default.createElement(BudgetSheet, { month: month, onClose: function () { setSheet(null); } }) : null,
+    sheet && sheet.t === "cash" ? o.default.createElement(CashSheet, { today: today, editing: sheet.editing, onClose: function () { setSheet(null); } }) : null,
+    sheet && sheet.t === "merchant" ? o.default.createElement(MerchantSheet, {
+      merchant: sheet.merchant, today: today,
+      onClose: function () { setSheet(null); },
+      onSplit: function (sp) { setSheet({ t: "split", spend: sp }); }
+    }) : null,
+    sheet && sheet.t === "split" ? o.default.createElement(SplitSheet, { spend: sheet.spend, onClose: function () { setSheet(null); } }) : null
+  );
+}
+
 function MClearBtn(onClick) {
   return o.default.createElement("button", {
     className: "p", onClick: onClick, title: "Clear",
@@ -1773,8 +2417,8 @@ async function parseCardStatementPdf(arrayBuffer) {
   };
 }
 
-function xy({onAvatar}){let e=(0,o.useRef)(new Date).current,[l,n]=(0,o.useState)(()=>fy()),[a,i]=(0,o.useState)(!1),[u,r]=(0,o.useState)(null),[by,setBy]=(0,o.useState)(e.getFullYear()),[f,g]=(0,o.useState)(""),[y,b]=(0,o.useState)(""),[h,v]=(0,o.useState)(()=>e.toISOString().slice(0,10)),[k,E]=(0,o.useState)("subscription"),[M,s]=(0,o.useState)("monthly"),[d,p]=(0,o.useState)(!1),[x,m]=(0,o.useState)(""),[pTab,setPTab]=(0,o.useState)("subs"),[bq,setBq]=(0,o.useState)(""),[cb,setCb]=(0,o.useState)(()=>Iy()),[ca,setCa]=(0,o.useState)(!1),[cbName,setCbName]=(0,o.useState)(""),[cbMonth,setCbMonth]=(0,o.useState)(()=>e.toISOString().slice(0,7)),[cbTotal,setCbTotal]=(0,o.useState)(""),[cbMain,setCbMain]=(0,o.useState)(""),[cbAddon,setCbAddon]=(0,o.useState)(""),[cbCats,setCbCats]=(0,o.useState)(()=>[{label:"",amount:""}]),[pdfBusy,setPdfBusy]=(0,o.useState)(!1),[pdfErr,setPdfErr]=(0,o.useState)(""),[pdfOk,setPdfOk]=(0,o.useState)(""),pdfInputRef=(0,o.useRef)(),[cbTxns,setCbTxns]=(0,o.useState)([]),[cbDue,setCbDue]=(0,o.useState)(""),[cbMin,setCbMin]=(0,o.useState)(""),[cbEditId,setCbEditId]=(0,o.useState)(null),[cardSel,setCardSel]=(0,o.useState)(null),[fHid,setFHid]=(0,o.useState)(()=>{try{return JSON.parse(localStorage.getItem("ht_v12_card_findings_hidden"))||[]}catch(w){return[]}});(0,o.useEffect)(()=>dy(l),[l]);(0,o.useEffect)(()=>Ry(cb),[cb]);let C=()=>{f.trim()&&(n(D=>[...D,{id:Date.now(),name:f.trim(),amount:Number(y)||0,dueDate:h,category:k,frequency:M,autopay:d,note:x.trim(),history:[]}]),g(""),b(""),v(e.toISOString().slice(0,10)),E("subscription"),s("monthly"),p(!1),m(""),i(!1))},CCu=(ix,fld,val)=>setCbCats(prev=>prev.map((r,i2)=>i2===ix?ot(P({},r),{[fld]:val}):r)),CCa=()=>setCbCats(prev=>[...prev,{label:"",amount:""}]),CCr=ix=>setCbCats(prev=>prev.filter((r,i2)=>i2!==ix)),CA=()=>{if(!cbName.trim()||!(Number(cbTotal)>0))return;let total=Number(cbTotal)||0,main=cbMain.trim()===""?total:Number(cbMain)||0,addon=Number(cbAddon)||0,cats=cbCats.filter(r=>r.label.trim()&&Number(r.amount)>0).map(r=>({label:r.label.trim(),amount:Number(r.amount)}));cbEditId?setCb(prev=>prev.map(x2=>x2.id===cbEditId?ot(P({},x2),{cardName:cbName.trim(),month:cbMonth,total,main,addon,categories:cats,transactions:cbTxns,dueDate:cbDue||null,minDue:Number(cbMin)||0}):x2)):setCb(prev=>[...prev,{id:Date.now(),cardName:cbName.trim(),month:cbMonth,total,main,addon,categories:cats,transactions:cbTxns,dueDate:cbDue||null,minDue:Number(cbMin)||0,paid:!1}]),setCbName(""),setCbMonth(e.toISOString().slice(0,7)),setCbTotal(""),setCbMain(""),setCbAddon(""),setCbCats([{label:"",amount:""}]),setCbTxns([]),setCbDue(""),setCbMin(""),setCbEditId(null),setPdfOk(""),setPdfErr(""),setCa(!1)},CD=D=>{let idx=cb.findIndex(N=>N.id===D),entry=cb[idx];setCb(J=>J.filter(N=>N.id!==D)),entry&&requestUndo(`Deleted "${entry.cardName} statement"`,()=>setCb(J=>{if(J.some(N=>N.id===D))return J;let arr=[...J];return arr.splice(Math.min(idx,arr.length),0,entry),arr}))},findings=(0,o.useMemo)(()=>cardFindings(cb,l).filter(x2=>fHid.indexOf(x2.id)===-1),[cb,l,fHid]),FH=id2=>setFHid(prev=>{let nx=[...prev,id2];try{localStorage.setItem("ht_v12_card_findings_hidden",JSON.stringify(nx))}catch(w){}return nx}),FAdd=fd=>{let iso=stmtDateToIso(fd.lastDate)||e.toISOString().slice(0,10),nd=new Date(iso+"T00:00:00");nd.setMonth(nd.getMonth()+1);let p2=w=>(w<10?"0":"")+w,due=nd.getFullYear()+"-"+p2(nd.getMonth()+1)+"-"+p2(nd.getDate());n(D=>[...D,{id:Date.now(),name:fd.merchant,amount:Math.round(fd.amount),dueDate:due,category:"subscription",frequency:"monthly",autopay:!1,note:"Detected from card statement",history:[]}]),FH(fd.id),requestUndo(`Added "${fd.merchant}" to Subscriptions`,()=>n(D=>D.filter(x2=>x2.name!==fd.merchant||x2.note!=="Detected from card statement")))},FUpd=fd=>{A(fd.billId,{amount:Math.round(fd.newAmount)}),FH(fd.id),requestUndo(`Updated "${fd.billName}" to \u20B9${Math.round(fd.newAmount)}`,()=>A(fd.billId,{amount:fd.oldAmount}))},CE=D=>{setCbEditId(D.id),setCbName(D.cardName||""),setCbMonth(D.month||e.toISOString().slice(0,7)),setCbTotal(String(D.total||"")),setCbMain(String(D.main||"")),setCbAddon(String(D.addon||"")),setCbDue(D.dueDate||""),setCbMin(D.minDue?String(D.minDue):""),setCbCats((D.categories||[]).length?D.categories.map(x2=>({label:x2.label,amount:String(x2.amount)})):[{label:"",amount:""}]),setCbTxns(D.transactions||[]),setPdfOk(""),setPdfErr(""),setCa(!0)},CP=D=>{buzz(14),setCb(prev=>prev.map(x2=>x2.id===D?ot(P({},x2),{paid:!x2.paid}):x2))},cardNames=[...new Set(cb.map(x2=>x2.cardName).filter(Boolean))],cbView=cardSel?cb.filter(x2=>x2.cardName===cardSel):cb,cbSorted=[...cbView].sort((D,J)=>(J.month||"").localeCompare(D.month||"")||J.id-D.id),onPdfSelected=async D=>{let file=D.target.files&&D.target.files[0];D.target.value="";if(!file)return;setPdfErr(""),setPdfOk(""),setPdfBusy(!0),setCbTxns([]);try{let buf=await file.arrayBuffer(),res=await parseCardStatementPdf(buf);if(!res)setPdfErr("Couldn't find transactions in this PDF \u2014 enter it manually below.");else{res.cardName&&setCbName(res.cardName),res.month&&setCbMonth(res.month),setCbTotal(String(res.total)),setCbMain(String(res.main)),setCbAddon(String(res.addon||0)),setCbCats(res.categories.length?res.categories.map(ct=>({label:ct.label,amount:String(ct.amount)})):[{label:"",amount:""}]),setCbTxns(res.transactions||[]),res.dueDate&&setCbDue(res.dueDate),res.minDue&&setCbMin(String(res.minDue)),setPdfOk("Found "+(res.transactions||[]).length+" transactions \u00b7 "+res.categories.length+" categories")}}catch(er){setPdfErr("Couldn't read this PDF \u2014 enter it manually below.")}setPdfBusy(!1)},z=D=>{let idx=l.findIndex(N=>N.id===D),bill=l[idx];n(J=>J.filter(N=>N.id!==D)),bill&&requestUndo(`Deleted "${bill.name}"`,()=>n(J=>{if(J.some(N=>N.id===D))return J;let arr=[...J];return arr.splice(Math.min(idx,arr.length),0,bill),arr}))},A=(D,J)=>n(N=>N.map(_=>_.id===D?P(P({},_),J):_)),B=D=>{n(J=>J.map(N=>{if(N.id!==D.id)return N;let _={date:e.toISOString().slice(0,10),amount:N.amount,dueDate:N.dueDate};return ot(P({},N),{dueDate:py(N.dueDate,N.frequency),history:[_,...N.history||[]].slice(0,24)})}))},O=l.map(D=>ot(P({},D),{daysLeft:gy(D,e)})).sort((D,J)=>{var N,_;return((N=D.daysLeft)!=null?N:9999)-((_=J.daysLeft)!=null?_:9999)}),Oc=(D,J)=>{let hist=(D.history||[]).filter(_=>{let X=new Date(_.date+"T00:00:00");return X.getFullYear()===by&&X.getMonth()===J});if(hist.length)return{day:new Date(hist[0].date+"T00:00:00").getDate(),amount:hist[0].amount!=null?hist[0].amount:D.amount};let N=new Date(D.dueDate+"T00:00:00"),dy0=N.getFullYear(),dm=N.getMonth(),dd=N.getDate(),yr=by;if(dy0>yr||dy0===yr&&dm>J)return null;let diff=(yr-dy0)*12+(J-dm),fr=D.frequency||"monthly";return fr==="monthly"||fr==="quarterly"&&diff%3===0||fr==="yearly"&&diff%12===0?{day:Math.min(dd,To(yr,J)),amount:D.amount}:null},S=(D,J)=>Oc(D,J)!==null,U=u===null?O:O.filter(D=>S(D,u)).sort((D,J)=>{var N,_;return((((N=Oc(D,u))==null?void 0:N.day))||99)-((((_=Oc(J,u))==null?void 0:_.day))||99)}),selTot=u===null?0:U.reduce((D,J)=>{var N;return D+((((N=Oc(J,u))==null?void 0:N.amount))||0)},0),w=Array.from({length:12},(D,J)=>O.filter(N=>S(N,J)).length),bqL=bq.trim().toLowerCase(),Uf=bqL?U.filter(D=>(D.name||"").toLowerCase().indexOf(bqL)>-1):U,K=Uf.filter(D=>D.autopay),bt=Uf.filter(D=>!D.autopay),H=O.filter(D=>D.daysLeft!==null&&D.daysLeft<0).length,G={monthly:12,quarterly:4,yearly:1},Mt=O.reduce((D,J)=>D+J.amount*(G[J.frequency]||12),0),Ct=D=>"\u20B9"+D.toLocaleString(void 0,{maximumFractionDigits:0});return o.default.createElement("div",{style:{padding:"16px"}},o.default.createElement("div",{style:{position:"sticky",top:0,zIndex:40,background:"rgba(236,240,247,0.92)",backdropFilter:"blur(24px)",WebkitBackdropFilter:"blur(24px)",margin:"-16px -16px 14px",padding:"16px 16px 6px"}},o.default.createElement("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"16px",paddingTop:"4px"}},o.default.createElement("div",null,o.default.createElement("div",{style:{fontSize:"22px",fontWeight:"700",color:c.ink,letterSpacing:"-0.03em",lineHeight:1.15}},"Payments"),o.default.createElement("div",{style:{fontSize:"13px",color:pTab==="cards"?(cb.some(x2=>!x2.paid)?c.red:c.blue):H>0?c.red:c.blue,fontWeight:"600",marginTop:"1px"}},pTab==="cards"?(cb.length===0?"No card bills yet":(()=>{let up=cb.filter(x2=>!x2.paid);return up.length?`${up.length} unpaid`:"All settled"})()):l.length===0?"No bills tracked yet":H>0?`${H} overdue`:"All caught up")),o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"8px",flexShrink:0}},pTab==="subs"&&(o.default.createElement("button",{className:"p",title:"All bills",onClick:()=>r(null),style:{width:"36px",height:"36px",borderRadius:"50%",border:u===null?"none":"0.5px solid rgba(255,255,255,0.6)",background:u===null?"linear-gradient(135deg,#007aff,#0051d5)":"rgba(255,255,255,0.55)",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",color:u===null?"#fff":c.inkFaint,boxShadow:u===null?"0 2px 10px rgba(0,122,255,0.45)":"0 2px 8px rgba(31,38,135,0.06)"}},o.default.createElement("svg",{width:"16",height:"16",viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:"2",strokeLinecap:"round",strokeLinejoin:"round"},o.default.createElement("path",{d:"M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1z"}),o.default.createElement("line",{x1:"8",y1:"8",x2:"16",y2:"8"}),o.default.createElement("line",{x1:"8",y1:"12",x2:"16",y2:"12"}),o.default.createElement("line",{x1:"8",y1:"16",x2:"12",y2:"16"})))),o.default.createElement("button",{className:"p",onClick:()=>pTab==="cards"?(setCbEditId(null),setCbName(""),setCbMonth(e.toISOString().slice(0,7)),setCbTotal(""),setCbMain(""),setCbAddon(""),setCbDue(""),setCbMin(""),setCbCats([{label:"",amount:""}]),setCbTxns([]),setPdfOk(""),setPdfErr(""),setCa(!0)):i(!0),style:{width:"36px",height:"36px",borderRadius:"50%",border:"none",background:"linear-gradient(135deg,#007aff,#0051d5)",cursor:"pointer",fontSize:"22px",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:"300",lineHeight:1,boxShadow:"0 2px 10px rgba(0,122,255,0.45),inset 0 1px 0 rgba(255,255,255,0.3)",flexShrink:0}},"+"),o.default.createElement(HeaderAvatar,{onClick:onAvatar}))),o.default.createElement("div",{style:{background:"rgba(118,118,128,0.12)",borderRadius:"11px",padding:"3px",display:"flex",gap:"2px",marginBottom:"14px"}},[["subs","Subscriptions"],["cards","Card Bills"]].map(([v,k2])=>o.default.createElement("button",{key:v,className:"seg",onClick:()=>setPTab(v),style:{background:pTab===v?"rgba(255,255,255,0.95)":"transparent",color:pTab===v?c.ink:"rgba(60,60,67,0.6)",boxShadow:pTab===v?"0 2px 8px rgba(0,0,0,0.12), 0 0.5px 1px rgba(0,0,0,0.08)":"none",fontWeight:pTab===v?"600":"400"}},k2))),pTab==="subs"&&l.length>0&&o.default.createElement("div",{style:{display:"flex",gap:"8px",marginBottom:"14px"}},o.default.createElement("div",{style:{flex:1,background:"rgba(255,255,255,0.55)",backdropFilter:"blur(20px) saturate(1.8)",WebkitBackdropFilter:"blur(20px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"16px",padding:"12px",boxShadow:"0 4px 16px rgba(31,38,135,0.05)"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:c.inkFaint,textTransform:"uppercase",letterSpacing:"0.03em"}},"Per Year"),o.default.createElement("div",{style:{fontSize:"19px",fontWeight:"800",color:c.ink,letterSpacing:"-0.02em",marginTop:"2px"}},o.default.createElement(CountUp,{v:Mt,fmt:Ct})),o.default.createElement("div",{style:{fontSize:"10px",color:c.inkFaint,marginTop:"2px"}},l.length," bill",l.length===1?"":"s")),o.default.createElement("div",{style:{flex:1,background:"rgba(255,255,255,0.55)",backdropFilter:"blur(20px) saturate(1.8)",WebkitBackdropFilter:"blur(20px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"16px",padding:"12px",boxShadow:"0 4px 16px rgba(31,38,135,0.05)"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:c.inkFaint,textTransform:"uppercase",letterSpacing:"0.03em"}},u===null?"This Month":Mo[u]+(by===e.getFullYear()?"":" "+by)),o.default.createElement("div",{style:{fontSize:"19px",fontWeight:"800",color:u===null?c.inkFaint:c.ink,letterSpacing:"-0.02em",marginTop:"2px"}},u===null?"\u2014":o.default.createElement(CountUp,{v:selTot,fmt:Ct})),u!==null&&o.default.createElement("div",{style:{fontSize:"10px",color:c.inkFaint,marginTop:"2px"}},U.length," bill",U.length===1?"":"s"))),pTab==="subs"&&l.length>0&&o.default.createElement("div",{style:{background:"rgba(255,255,255,0.55)",backdropFilter:"blur(24px) saturate(1.8)",WebkitBackdropFilter:"blur(24px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"18px",padding:"12px 14px",marginBottom:"14px",boxShadow:"0 8px 24px rgba(31,38,135,0.06), inset 0 1px 0 rgba(255,255,255,0.6)",overflowX:"auto"}},o.default.createElement("div",{style:{display:"flex",alignItems:"center",justifyContent:"center",gap:"14px",marginBottom:"8px"}},o.default.createElement("button",{className:"p",onClick:()=>setBy(by-1),style:{width:"24px",height:"24px",borderRadius:"50%",border:"none",background:c.bg,cursor:"pointer",color:c.inkFaint,fontSize:"13px",display:"flex",alignItems:"center",justifyContent:"center"}},"\u2039"),o.default.createElement("span",{style:{fontSize:"13px",fontWeight:"700",color:c.ink,minWidth:"44px",textAlign:"center"}},by),o.default.createElement("button",{className:"p",onClick:()=>setBy(by+1),style:{width:"24px",height:"24px",borderRadius:"50%",border:"none",background:c.bg,cursor:"pointer",color:c.inkFaint,fontSize:"13px",display:"flex",alignItems:"center",justifyContent:"center"}},"\u203A")),o.default.createElement("div",{style:{display:"flex",gap:"8px",width:"max-content",alignItems:"flex-end"}},D1.map((D,J)=>{let N=w[J],_=J===u;return o.default.createElement("div",{key:J,className:"p",onClick:()=>r(_?null:J),style:{display:"flex",flexDirection:"column",alignItems:"center",gap:"3px",cursor:"pointer",minWidth:"30px"}},o.default.createElement("div",{style:{fontSize:"9px",color:_?c.ink:c.inkFaint,fontStyle:_?"italic":"normal",fontWeight:_?"600":"400"}},D),o.default.createElement("div",{style:{width:"28px",height:"3px",background:_?c.ink:N>0?c.green:c.borderLt,transition:"all 0.15s"}}),N>0&&o.default.createElement("div",{style:{fontSize:"9px",color:_?c.ink:c.green}},N))})))),pTab==="subs"&&o.default.createElement(o.default.Fragment,null,a?o.default.createElement(MSheet,{title:"New Bill",onClose:()=>i(!1),onSave:C,canSave:!!f.trim(),saveLabel:"Add"},o.default.createElement(MField,{label:"Name",value:f,onChange:g,autoFocus:!0,onEnter:C,placeholder:"e.g. Netflix, BSES Electricity"}),o.default.createElement(MPair,null,o.default.createElement(MField,{label:"Amount",value:y,onChange:b,type:"number",inputMode:"decimal",prefix:"\u20B9"}),o.default.createElement(MField,{label:"Next due date",type:"date",value:h,onChange:v})),o.default.createElement(MChips,{label:"Category",options:Eo,value:k,onChange:E}),o.default.createElement(MChips,{label:"Frequency",options:_1,value:M,onChange:s}),o.default.createElement(MField,{label:"Notes (optional)",value:x,onChange:m,multiline:!0}),o.default.createElement(MSwitch,{label:"Autopay enabled",sub:"Charged automatically \u2014 nothing for you to do",value:d,onChange:()=>p(D=>!D)})):null,l.length===0&&!a&&o.default.createElement("div",{style:{textAlign:"center",padding:"40px 20px"}},o.default.createElement("div",{style:{fontSize:"14px",fontWeight:"500",color:c.inkMid,marginBottom:"4px"}},"No bills yet"),o.default.createElement("div",{style:{fontSize:"12px",color:c.inkFaint}},"Track subscriptions, utilities, rent \u2014 anything recurring.")),l.length>0&&o.default.createElement(o.default.Fragment,null,u!==null&&o.default.createElement("div",{style:{fontSize:"13px",color:c.inkFaint,marginBottom:"12px"}},Mo[u]," \u2014 ",o.default.createElement("span",{style:{color:c.green,fontWeight:"600"}},U.length)," bill",U.length===1?"":"s"),u===null&&l.length>0&&(()=>{let G2={monthly:12,quarterly:4,yearly:1},segs=Eo.map(ct=>({ct,amt:l.filter(D=>(D.category||"other")===ct.id).reduce((s2,D)=>s2+(Number(D.amount)||0)*(G2[D.frequency]||12),0)})).filter(s2=>s2.amt>0).sort((a2,b2)=>b2.amt-a2.amt),tot=segs.reduce((s2,x2)=>s2+x2.amt,0);if(!tot)return null;let CF=2*Math.PI*40,acc=0;return o.default.createElement("div",{style:{background:"rgba(255,255,255,0.55)",backdropFilter:"blur(24px) saturate(1.8)",WebkitBackdropFilter:"blur(24px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"18px",padding:"14px",marginBottom:"14px",boxShadow:"0 8px 24px rgba(31,38,135,0.06), inset 0 1px 0 rgba(255,255,255,0.6)",display:"flex",alignItems:"center",gap:"14px"}},o.default.createElement("div",{style:{position:"relative",width:"104px",height:"104px",flexShrink:0}},o.default.createElement("svg",{width:"104",height:"104",viewBox:"0 0 100 100",style:{transform:"rotate(-90deg)"}},o.default.createElement("circle",{cx:"50",cy:"50",r:"40",fill:"none",stroke:"rgba(60,60,67,0.08)",strokeWidth:"13"}),segs.map((s2,i2)=>{let fr2=s2.amt/tot,dash=Math.max(0,fr2*CF-1.5),off=-acc*CF;return acc+=fr2,o.default.createElement("circle",{key:i2,cx:"50",cy:"50",r:"40",fill:"none",stroke:s2.ct.color,strokeWidth:"13",strokeDasharray:dash+" "+(CF-dash),strokeDashoffset:off})})),o.default.createElement("div",{style:{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}},o.default.createElement("div",{style:{fontSize:"12px",fontWeight:"800",color:c.ink,letterSpacing:"-0.02em"}},Ct(tot)),o.default.createElement("div",{style:{fontSize:"8px",fontWeight:"600",color:c.inkFaint,textTransform:"uppercase"}},"per year"))),o.default.createElement("div",{style:{flex:1,minWidth:0}},segs.map((s2,i2)=>o.default.createElement("div",{key:i2,style:{display:"flex",alignItems:"center",gap:"7px",marginBottom:i2===segs.length-1?0:"7px"}},o.default.createElement("span",{style:{width:"9px",height:"9px",borderRadius:"3px",background:s2.ct.color,flexShrink:0}}),o.default.createElement("span",{style:{flex:1,fontSize:"11px",fontWeight:"600",color:c.ink,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}},s2.ct.label),o.default.createElement("span",{style:{fontSize:"10px",color:c.inkFaint,fontWeight:"600"}},Math.round(s2.amt/tot*100),"%"),o.default.createElement("span",{style:{fontSize:"11px",fontWeight:"700",color:c.ink,minWidth:"52px",textAlign:"right"}},Ct(s2.amt)))))
-)})(),l.length>3&&o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"8px",background:"rgba(255,255,255,0.7)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"12px",padding:"8px 12px",marginBottom:"12px",backdropFilter:"blur(10px)",WebkitBackdropFilter:"blur(10px)"}},o.default.createElement("svg",{width:"14",height:"14",viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:"2",strokeLinecap:"round",strokeLinejoin:"round",style:{flexShrink:0,color:c.inkFaint}},o.default.createElement("circle",{cx:"11",cy:"11",r:"8"}),o.default.createElement("line",{x1:"21",y1:"21",x2:"16.65",y2:"16.65"})),o.default.createElement("input",{value:bq,onChange:D=>setBq(D.target.value),placeholder:"Search bills\u2026",style:{flex:1,border:"none",outline:"none",background:"transparent",fontSize:"13px",color:c.ink,fontFamily:"inherit",minWidth:0,padding:"7px 0",minHeight:"30px"}}),bq&&o.default.createElement("button",{className:"p",onClick:()=>setBq(""),style:{border:"none",background:"transparent",color:c.inkFaint,fontSize:"14px",cursor:"pointer",padding:0,flexShrink:0}},"\u2715")),bt.length>0&&o.default.createElement("div",{style:{marginBottom:"18px"}},o.default.createElement("div",{style:{fontSize:"11px",fontWeight:"700",color:c.inkMid,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:"10px",display:"flex",alignItems:"center",gap:"6px"}},o.default.createElement("svg",{width:"12",height:"12",viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:"2",strokeLinecap:"round",strokeLinejoin:"round"},o.default.createElement("path",{d:"M21 8V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-2"}),o.default.createElement("path",{d:"M21 12H7"}),o.default.createElement("path",{d:"M15 8l4 4-4 4"})),"Need to Pay \u2014 ",bt.length),o.default.createElement("div",{style:{display:"flex",flexDirection:"column",gap:"8px"}},bt.map(D=>o.default.createElement(E1,{key:D.id,bill:D,fmtMoney:Ct,onMarkPaid:()=>B(D),onDelete:()=>z(D.id),onUpdate:J=>A(D.id,J)})))),K.length>0&&o.default.createElement("div",null,o.default.createElement("div",{style:{fontSize:"11px",fontWeight:"700",color:c.inkMid,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:"10px",display:"flex",alignItems:"center",gap:"6px"}},o.default.createElement("svg",{width:"12",height:"12",viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:"2",strokeLinecap:"round",strokeLinejoin:"round"},o.default.createElement("polyline",{points:"20 6 9 17 4 12"})),"Autopay \u2014 ",K.length),o.default.createElement("div",{style:{display:"flex",flexDirection:"column",gap:"8px"}},K.map(D=>o.default.createElement(E1,{key:D.id,bill:D,fmtMoney:Ct,onDelete:()=>z(D.id),onUpdate:J=>A(D.id,J)})))),u!==null&&U.length===0&&o.default.createElement("div",{style:{textAlign:"center",padding:"32px 20px",color:c.inkFaint,fontSize:"13px"}},"Nothing due or paid in ",Mo[u],"."))),pTab==="cards"&&o.default.createElement(o.default.Fragment,null,ca?o.default.createElement(MSheet,{title:cbEditId?"Edit Card Statement":"New Card Statement",onClose:()=>{setCa(!1),setCbTxns([]),setCbDue(""),setCbMin(""),setCbEditId(null),setPdfErr(""),setPdfOk("")},onSave:CA,canSave:!!(cbName.trim()&&Number(cbTotal)>0),saveLabel:cbEditId?"Save":"Save"},o.default.createElement("input",{ref:pdfInputRef,type:"file",accept:"application/pdf",style:{display:"none"},onChange:onPdfSelected}),o.default.createElement("button",{className:"p",onClick:()=>pdfInputRef.current&&pdfInputRef.current.click(),disabled:pdfBusy,style:{width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:"8px",padding:"12px",border:"1.5px dashed "+c.blue,borderRadius:"12px",background:c.blueBg,color:c.blue,fontSize:"13px",fontWeight:"600",cursor:pdfBusy?"default":"pointer",marginBottom:"6px",opacity:pdfBusy?.6:1}},"\u{1F4C4} ",pdfBusy?"Reading statement\u2026":"Upload Statement (PDF) \u2014 auto-fill"),pdfErr&&o.default.createElement("div",{style:{fontSize:"11px",color:c.red,marginBottom:"8px"}},pdfErr),pdfOk&&o.default.createElement("div",{style:{fontSize:"11px",fontWeight:"600",color:"#1e8e3e",marginBottom:"8px"}},"\u2713 ",pdfOk),o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"8px",margin:"4px 0 14px"}},o.default.createElement("div",{style:{flex:1,height:"1px",background:c.borderLt}}),o.default.createElement("span",{style:{fontSize:"9px",color:c.inkFaint,fontWeight:"700",letterSpacing:"0.04em"}},"OR ENTER MANUALLY"),o.default.createElement("div",{style:{flex:1,height:"1px",background:c.borderLt}})),o.default.createElement(MField,{label:"Card name",value:cbName,onChange:setCbName,autoFocus:!0,placeholder:"e.g. Kotak Solitaire"}),o.default.createElement(MPair,null,o.default.createElement(MField,{label:"Statement month",type:"month",value:cbMonth,onChange:setCbMonth}),o.default.createElement(MField,{label:"Total due",type:"number",inputMode:"decimal",prefix:"\u20B9",value:cbTotal,onChange:setCbTotal})),o.default.createElement(MPair,null,o.default.createElement(MField,{label:"Main card",type:"number",inputMode:"decimal",prefix:"\u20B9",value:cbMain,onChange:setCbMain}),o.default.createElement(MField,{label:"Add-on card",type:"number",inputMode:"decimal",prefix:"\u20B9",value:cbAddon,onChange:setCbAddon})),o.default.createElement(MPair,null,o.default.createElement(MField,{label:"Payment due date",type:"date",value:cbDue,onChange:setCbDue}),o.default.createElement(MField,{label:"Minimum due",type:"number",inputMode:"decimal",prefix:"\u20B9",value:cbMin,onChange:setCbMin})),o.default.createElement(MSectionLabel,null,"Category breakdown"),o.default.createElement("div",{style:{display:"flex",flexDirection:"column",gap:"6px",marginBottom:"8px"}},cbCats.map((D,J)=>o.default.createElement("div",{key:J,style:{display:"flex",gap:"6px",alignItems:"center"}},o.default.createElement("input",{value:D.label,onChange:N=>CCu(J,"label",N.target.value),placeholder:"Category e.g. Restaurants",style:{flex:2,border:"1px solid "+c.border,borderRadius:"10px",padding:"11px 12px",fontSize:"13px",outline:"none",background:c.bg,color:c.ink,boxSizing:"border-box",minWidth:0,fontFamily:"inherit"}}),o.default.createElement("input",{type:"number",inputMode:"decimal",value:D.amount,onChange:N=>CCu(J,"amount",N.target.value),placeholder:"₹",style:{flex:1,border:"1px solid "+c.border,borderRadius:"10px",padding:"11px 12px",fontSize:"13px",outline:"none",background:c.bg,color:c.ink,boxSizing:"border-box",minWidth:0,fontFamily:"inherit"}}),o.default.createElement("button",{className:"p",onClick:()=>CCr(J),title:"Remove",style:{width:"36px",height:"36px",borderRadius:"50%",border:"none",background:c.bgCard,color:c.inkFaint,cursor:"pointer",fontSize:"15px",flexShrink:0,fontFamily:"inherit"}},"×")))),o.default.createElement("button",{className:"p",onClick:CCa,style:{width:"100%",minHeight:"44px",padding:"12px",border:"1px dashed "+c.border,borderRadius:"12px",background:"transparent",color:c.blue,fontSize:"13px",fontWeight:"600",cursor:"pointer",marginBottom:"6px",fontFamily:"inherit"}},"+ Add category")):null,findings.length>0&&!ca&&o.default.createElement("div",{style:{background:"rgba(255,255,255,0.55)",backdropFilter:"blur(24px) saturate(1.8)",WebkitBackdropFilter:"blur(24px) saturate(1.8)",border:"0.5px solid rgba(255,204,0,0.4)",borderRadius:"18px",padding:"14px",marginBottom:"14px",boxShadow:"0 8px 24px rgba(31,38,135,0.06), inset 0 1px 0 rgba(255,255,255,0.6)"}},o.default.createElement("div",{style:{fontSize:"10px",fontWeight:"700",color:"#8a6a00",textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:"10px"}},"\u{1F50E} Smart findings \u00b7 "+findings.length),findings.slice(0,6).map((fd,i2)=>{let brand=hy(fd.merchant)||vy(fd.merchant),title=fd.type==="untracked"?fd.merchant:fd.type==="price"?fd.billName||fd.merchant:fd.merchant,sub=fd.type==="untracked"?("Charged "+fd.months+" months \u00b7 ~"+Ct(fd.amount)+"/mo \u00b7 not tracked"):fd.type==="price"?("Price changed "+Ct(fd.oldAmount)+" \u2192 "+Ct(fd.newAmount)):(fd.count+"\u00d7 "+Ct(fd.amount)+" on "+fmtStmtDate(fd.date));return o.default.createElement("div",{key:fd.id,style:{display:"flex",alignItems:"center",gap:"10px",padding:"7px 0",borderTop:i2===0?"none":"0.5px solid rgba(60,60,67,0.07)"}},o.default.createElement("div",{style:{width:"28px",height:"28px",borderRadius:"9px",background:brand.bg,color:brand.fg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:brand.mark.length>2?"8px":"11px",fontWeight:"800",flexShrink:0}},brand.mark),o.default.createElement("div",{style:{flex:1,minWidth:0}},o.default.createElement("div",{style:{fontSize:"12.5px",fontWeight:"600",color:c.ink,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}},title),o.default.createElement("div",{style:{fontSize:"10px",color:fd.type==="duplicate"?c.red:c.inkFaint,marginTop:"1px",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}},sub)),fd.type==="untracked"&&o.default.createElement("button",{className:"p",onClick:()=>FAdd(fd),style:{padding:"5px 11px",border:"none",borderRadius:"999px",background:c.blue,color:"#fff",fontSize:"11px",fontWeight:"700",cursor:"pointer",flexShrink:0}},"Track"),fd.type==="price"&&o.default.createElement("button",{className:"p",onClick:()=>FUpd(fd),style:{padding:"5px 11px",border:"none",borderRadius:"999px",background:c.blue,color:"#fff",fontSize:"11px",fontWeight:"700",cursor:"pointer",flexShrink:0}},"Update"),o.default.createElement("button",{className:"p",onClick:()=>FH(fd.id),style:{width:"24px",height:"24px",border:"none",borderRadius:"50%",background:c.bg,color:c.inkFaint,fontSize:"12px",cursor:"pointer",flexShrink:0}},"\xD7"))})),cb.length>0&&!ca&&cardNames.length>1&&o.default.createElement("div",{style:{display:"flex",gap:"6px",overflowX:"auto",marginBottom:"12px",paddingBottom:"2px"}},[{id:null,label:"All cards"}].concat(cardNames.map(nm=>({id:nm,label:nm}))).map((cd,i2)=>{let on=cardSel===cd.id;return o.default.createElement("button",{key:i2,className:"p",onClick:()=>setCardSel(cd.id),style:{flexShrink:0,border:"none",cursor:"pointer",fontSize:"11px",fontWeight:"700",padding:"6px 12px",borderRadius:"999px",background:on?"linear-gradient(135deg,#007aff,#0051d5)":"rgba(255,255,255,0.7)",color:on?"#fff":c.ink,boxShadow:on?"0 2px 8px rgba(0,122,255,0.35)":"0 1px 4px rgba(31,38,135,0.08)",maxWidth:"150px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},cd.label)})),cbView.length>1&&!ca&&(()=>{let mAgg={};cbView.forEach(x2=>{if(!x2.month)return;mAgg[x2.month]=(mAgg[x2.month]||0)+(Number(x2.total)||0)});let series=Object.keys(mAgg).sort().slice(-6).map(k2=>({month:k2,total:mAgg[k2]})),mx=Math.max.apply(null,series.map(x2=>x2.total))||1;return o.default.createElement("div",{style:{background:"rgba(255,255,255,0.55)",backdropFilter:"blur(24px) saturate(1.8)",WebkitBackdropFilter:"blur(24px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"18px",padding:"14px",marginBottom:"14px",boxShadow:"0 8px 24px rgba(31,38,135,0.06), inset 0 1px 0 rgba(255,255,255,0.6)"}},o.default.createElement("div",{style:{fontSize:"10px",fontWeight:"700",color:c.inkFaint,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:"12px"}},"Spend trend"),o.default.createElement("div",{style:{display:"flex",gap:"8px",alignItems:"flex-end",height:"92px"}},series.map((st,i2)=>{let h=Math.max(4,Math.round((Number(st.total)||0)/mx*62)),last=i2===series.length-1,lb=st.month?D1[Number(st.month.split("-")[1])-1]:"";return o.default.createElement("div",{key:i2,style:{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:"4px",height:"100%",justifyContent:"flex-end"}},o.default.createElement("div",{style:{fontSize:"8.5px",fontWeight:"700",color:last?c.ink:c.inkFaint,whiteSpace:"nowrap"}},Ct(Number(st.total)||0)),o.default.createElement("div",{style:{width:"100%",maxWidth:"38px",height:h+"px",borderRadius:"7px",background:last?"linear-gradient(180deg,#3FA8FF,#0A7CFF)":"rgba(10,124,255,0.28)"}}),o.default.createElement("div",{style:{fontSize:"9px",fontWeight:last?"800":"500",color:last?c.ink:"rgba(60,60,67,0.5)"}},lb))})))})(),cbView.length>0&&!ca&&(()=>{let mAgg2={};cbView.forEach(x2=>{if(!x2.month)return;mAgg2[x2.month]=(mAgg2[x2.month]||0)+(Number(x2.total)||0)});let mKeys=Object.keys(mAgg2).sort(),latest=mKeys.length?{month:mKeys[mKeys.length-1],total:mAgg2[mKeys[mKeys.length-1]]}:null,prev=mKeys.length>1?{month:mKeys[mKeys.length-2],total:mAgg2[mKeys[mKeys.length-2]]}:null,allTot=cbView.reduce((s2,x2)=>s2+(Number(x2.total)||0),0),unpaid=cbView.filter(x2=>!x2.paid),unpaidTot=unpaid.reduce((s2,x2)=>s2+(Number(x2.total)||0),0),diff=prev?latest.total-prev.total:null,diffPct=prev&&prev.total?Math.round((latest.total-prev.total)/prev.total*100):null,mLab=latest&&latest.month?(()=>{let p2=latest.month.split("-");return Mo[Number(p2[1])-1]})():"Latest";if(!latest)return null;return o.default.createElement("div",{style:{display:"flex",gap:"8px",marginBottom:"14px"}},o.default.createElement("div",{style:{flex:1,background:"rgba(255,255,255,0.55)",backdropFilter:"blur(20px) saturate(1.8)",WebkitBackdropFilter:"blur(20px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"16px",padding:"12px",boxShadow:"0 4px 16px rgba(31,38,135,0.05)"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:c.inkFaint,textTransform:"uppercase",letterSpacing:"0.03em"}},mLab),o.default.createElement("div",{style:{fontSize:"19px",fontWeight:"800",color:c.ink,letterSpacing:"-0.02em",marginTop:"2px"}},o.default.createElement(CountUp,{v:latest.total,fmt:Ct})),diff!==null?o.default.createElement("div",{style:{fontSize:"10px",fontWeight:"700",color:diff>0?c.red:"#1e8e3e",marginTop:"2px"}},(diff>0?"\u25B2 +":"\u25BC ")+Ct(Math.abs(diff))+(diffPct!==null?" ("+(diff>0?"+":"")+diffPct+"%)":"")):o.default.createElement("div",{style:{fontSize:"10px",color:c.inkFaint,marginTop:"2px"}},"first month")),o.default.createElement("div",{style:{flex:1,background:"rgba(255,255,255,0.55)",backdropFilter:"blur(20px) saturate(1.8)",WebkitBackdropFilter:"blur(20px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"16px",padding:"12px",boxShadow:"0 4px 16px rgba(31,38,135,0.05)"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:unpaid.length?c.red:c.inkFaint,textTransform:"uppercase",letterSpacing:"0.03em"}},unpaid.length?"Unpaid":"All settled"),o.default.createElement("div",{style:{fontSize:"19px",fontWeight:"800",color:unpaid.length?c.red:"#1e8e3e",letterSpacing:"-0.02em",marginTop:"2px"}},unpaid.length?o.default.createElement(CountUp,{v:unpaidTot,fmt:Ct}):"\u2713"),o.default.createElement("div",{style:{fontSize:"10px",color:c.inkFaint,marginTop:"2px"}},unpaid.length?unpaid.length+" statement"+(unpaid.length===1?"":"s"):cbView.length+" statement"+(cbView.length===1?"":"s")+" tracked")))})(),cb.length===0&&!ca&&o.default.createElement("div",{style:{textAlign:"center",padding:"40px 20px"}},o.default.createElement("div",{style:{fontSize:"14px",fontWeight:"500",color:c.inkMid,marginBottom:"4px"}},"No card statements yet"),o.default.createElement("div",{style:{fontSize:"12px",color:c.inkFaint}},"Add a monthly statement to track totals and category spend.")),cb.length>0&&o.default.createElement("div",{style:{display:"flex",flexDirection:"column",gap:"12px"}},cbSorted.map((D,ix9)=>o.default.createElement(Ky,{key:D.id,entry:D,fmtMoney:Ct,onDelete:()=>CD(D.id),onTogglePaid:()=>CP(D.id),onEdit:()=>CE(D),prevEntry:cbSorted.slice(ix9+1).find(z2=>z2.cardName===D.cardName)||null,defaultOpen:ix9===0})))))}var CARD_CITIES = ["NEW DELHI","NEWDELHI","SOUTH DELHI","GURUGRAM","GURGAON","BENGALURU URB","BENGALURU","BANGALORE","MUMBAI","NAVI MUMBAI","DELHI","HYDERABAD","PUNE","CHENNAI","KOLKATA","NOIDA","GHAZIABAD","FARIDABAD","AHMEDABAD","JAIPUR","CHANDIGARH","KOCHI","THANE","LUCKNOW","INDORE","SURAT","GOA","LONDON","SINGAPORE","DUBAI"];
+function xy({onAvatar}){let e=(0,o.useRef)(new Date).current,[l,n]=(0,o.useState)(()=>fy()),[a,i]=(0,o.useState)(!1),[u,r]=(0,o.useState)(null),[by,setBy]=(0,o.useState)(e.getFullYear()),[f,g]=(0,o.useState)(""),[y,b]=(0,o.useState)(""),[h,v]=(0,o.useState)(()=>e.toISOString().slice(0,10)),[k,E]=(0,o.useState)("subscription"),[M,s]=(0,o.useState)("monthly"),[d,p]=(0,o.useState)(!1),[x,m]=(0,o.useState)(""),[pTab,setPTab]=(0,o.useState)("subs"),[spendAdd,setSpendAdd]=(0,o.useState)(0),[metaCard,setMetaCard]=(0,o.useState)(null),[merchOpen,setMerchOpen]=(0,o.useState)(null),[splitOpen,setSplitOpen]=(0,o.useState)(null),[bq,setBq]=(0,o.useState)(""),[cb,setCb]=(0,o.useState)(()=>Iy()),[ca,setCa]=(0,o.useState)(!1),[cbName,setCbName]=(0,o.useState)(""),[cbMonth,setCbMonth]=(0,o.useState)(()=>e.toISOString().slice(0,7)),[cbTotal,setCbTotal]=(0,o.useState)(""),[cbMain,setCbMain]=(0,o.useState)(""),[cbAddon,setCbAddon]=(0,o.useState)(""),[cbCats,setCbCats]=(0,o.useState)(()=>[{label:"",amount:""}]),[pdfBusy,setPdfBusy]=(0,o.useState)(!1),[pdfErr,setPdfErr]=(0,o.useState)(""),[pdfOk,setPdfOk]=(0,o.useState)(""),pdfInputRef=(0,o.useRef)(),[cbTxns,setCbTxns]=(0,o.useState)([]),[cbDue,setCbDue]=(0,o.useState)(""),[cbMin,setCbMin]=(0,o.useState)(""),[cbEditId,setCbEditId]=(0,o.useState)(null),[cardSel,setCardSel]=(0,o.useState)(null),[fHid,setFHid]=(0,o.useState)(()=>{try{return JSON.parse(localStorage.getItem("ht_v12_card_findings_hidden"))||[]}catch(w){return[]}});(0,o.useEffect)(()=>dy(l),[l]);(0,o.useEffect)(()=>Ry(cb),[cb]);let C=()=>{f.trim()&&(n(D=>[...D,{id:Date.now(),name:f.trim(),amount:Number(y)||0,dueDate:h,category:k,frequency:M,autopay:d,note:x.trim(),history:[]}]),g(""),b(""),v(e.toISOString().slice(0,10)),E("subscription"),s("monthly"),p(!1),m(""),i(!1))},CCu=(ix,fld,val)=>setCbCats(prev=>prev.map((r,i2)=>i2===ix?ot(P({},r),{[fld]:val}):r)),CCa=()=>setCbCats(prev=>[...prev,{label:"",amount:""}]),CCr=ix=>setCbCats(prev=>prev.filter((r,i2)=>i2!==ix)),CA=()=>{if(!cbName.trim()||!(Number(cbTotal)>0))return;let total=Number(cbTotal)||0,main=cbMain.trim()===""?total:Number(cbMain)||0,addon=Number(cbAddon)||0,cats=cbCats.filter(r=>r.label.trim()&&Number(r.amount)>0).map(r=>({label:r.label.trim(),amount:Number(r.amount)}));cbEditId?setCb(prev=>prev.map(x2=>x2.id===cbEditId?ot(P({},x2),{cardName:cbName.trim(),month:cbMonth,total,main,addon,categories:cats,transactions:cbTxns,dueDate:cbDue||null,minDue:Number(cbMin)||0}):x2)):setCb(prev=>[...prev,{id:Date.now(),cardName:cbName.trim(),month:cbMonth,total,main,addon,categories:cats,transactions:cbTxns,dueDate:cbDue||null,minDue:Number(cbMin)||0,paid:!1}]),setCbName(""),setCbMonth(e.toISOString().slice(0,7)),setCbTotal(""),setCbMain(""),setCbAddon(""),setCbCats([{label:"",amount:""}]),setCbTxns([]),setCbDue(""),setCbMin(""),setCbEditId(null),setPdfOk(""),setPdfErr(""),setCa(!1)},CD=D=>{let idx=cb.findIndex(N=>N.id===D),entry=cb[idx];setCb(J=>J.filter(N=>N.id!==D)),entry&&requestUndo(`Deleted "${entry.cardName} statement"`,()=>setCb(J=>{if(J.some(N=>N.id===D))return J;let arr=[...J];return arr.splice(Math.min(idx,arr.length),0,entry),arr}))},findings=(0,o.useMemo)(()=>cardFindings(cb,l).filter(x2=>fHid.indexOf(x2.id)===-1),[cb,l,fHid]),FH=id2=>setFHid(prev=>{let nx=[...prev,id2];try{localStorage.setItem("ht_v12_card_findings_hidden",JSON.stringify(nx))}catch(w){}return nx}),FAdd=fd=>{let iso=stmtDateToIso(fd.lastDate)||e.toISOString().slice(0,10),nd=new Date(iso+"T00:00:00");nd.setMonth(nd.getMonth()+1);let p2=w=>(w<10?"0":"")+w,due=nd.getFullYear()+"-"+p2(nd.getMonth()+1)+"-"+p2(nd.getDate());n(D=>[...D,{id:Date.now(),name:fd.merchant,amount:Math.round(fd.amount),dueDate:due,category:"subscription",frequency:"monthly",autopay:!1,note:"Detected from card statement",history:[]}]),FH(fd.id),requestUndo(`Added "${fd.merchant}" to Subscriptions`,()=>n(D=>D.filter(x2=>x2.name!==fd.merchant||x2.note!=="Detected from card statement")))},FUpd=fd=>{A(fd.billId,{amount:Math.round(fd.newAmount)}),FH(fd.id),requestUndo(`Updated "${fd.billName}" to \u20B9${Math.round(fd.newAmount)}`,()=>A(fd.billId,{amount:fd.oldAmount}))},CE=D=>{setCbEditId(D.id),setCbName(D.cardName||""),setCbMonth(D.month||e.toISOString().slice(0,7)),setCbTotal(String(D.total||"")),setCbMain(String(D.main||"")),setCbAddon(String(D.addon||"")),setCbDue(D.dueDate||""),setCbMin(D.minDue?String(D.minDue):""),setCbCats((D.categories||[]).length?D.categories.map(x2=>({label:x2.label,amount:String(x2.amount)})):[{label:"",amount:""}]),setCbTxns(D.transactions||[]),setPdfOk(""),setPdfErr(""),setCa(!0)},CP=D=>{buzz(14),setCb(prev=>prev.map(x2=>x2.id===D?ot(P({},x2),{paid:!x2.paid}):x2))},cardNames=[...new Set(cb.map(x2=>x2.cardName).filter(Boolean))],cbView=cardSel?cb.filter(x2=>x2.cardName===cardSel):cb,cbSorted=[...cbView].sort((D,J)=>(J.month||"").localeCompare(D.month||"")||J.id-D.id),onPdfSelected=async D=>{let file=D.target.files&&D.target.files[0];D.target.value="";if(!file)return;setPdfErr(""),setPdfOk(""),setPdfBusy(!0),setCbTxns([]);try{let buf=await file.arrayBuffer(),res=await parseCardStatementPdf(buf);if(!res)setPdfErr("Couldn't find transactions in this PDF \u2014 enter it manually below.");else{res.cardName&&setCbName(res.cardName),res.month&&setCbMonth(res.month),setCbTotal(String(res.total)),setCbMain(String(res.main)),setCbAddon(String(res.addon||0)),setCbCats(res.categories.length?res.categories.map(ct=>({label:ct.label,amount:String(ct.amount)})):[{label:"",amount:""}]),setCbTxns(res.transactions||[]),res.dueDate&&setCbDue(res.dueDate),res.minDue&&setCbMin(String(res.minDue)),setPdfOk("Found "+(res.transactions||[]).length+" transactions \u00b7 "+res.categories.length+" categories")}}catch(er){setPdfErr("Couldn't read this PDF \u2014 enter it manually below.")}setPdfBusy(!1)},z=D=>{let idx=l.findIndex(N=>N.id===D),bill=l[idx];n(J=>J.filter(N=>N.id!==D)),bill&&requestUndo(`Deleted "${bill.name}"`,()=>n(J=>{if(J.some(N=>N.id===D))return J;let arr=[...J];return arr.splice(Math.min(idx,arr.length),0,bill),arr}))},A=(D,J)=>n(N=>N.map(_=>_.id===D?P(P({},_),J):_)),B=D=>{n(J=>J.map(N=>{if(N.id!==D.id)return N;let _={date:e.toISOString().slice(0,10),amount:N.amount,dueDate:N.dueDate};return ot(P({},N),{dueDate:py(N.dueDate,N.frequency),history:[_,...N.history||[]].slice(0,24)})}))},O=l.map(D=>ot(P({},D),{daysLeft:gy(D,e)})).sort((D,J)=>{var N,_;return((N=D.daysLeft)!=null?N:9999)-((_=J.daysLeft)!=null?_:9999)}),Oc=(D,J)=>{let hist=(D.history||[]).filter(_=>{let X=new Date(_.date+"T00:00:00");return X.getFullYear()===by&&X.getMonth()===J});if(hist.length)return{day:new Date(hist[0].date+"T00:00:00").getDate(),amount:hist[0].amount!=null?hist[0].amount:D.amount};let N=new Date(D.dueDate+"T00:00:00"),dy0=N.getFullYear(),dm=N.getMonth(),dd=N.getDate(),yr=by;if(dy0>yr||dy0===yr&&dm>J)return null;let diff=(yr-dy0)*12+(J-dm),fr=D.frequency||"monthly";return fr==="monthly"||fr==="quarterly"&&diff%3===0||fr==="yearly"&&diff%12===0?{day:Math.min(dd,To(yr,J)),amount:D.amount}:null},S=(D,J)=>Oc(D,J)!==null,U=u===null?O:O.filter(D=>S(D,u)).sort((D,J)=>{var N,_;return((((N=Oc(D,u))==null?void 0:N.day))||99)-((((_=Oc(J,u))==null?void 0:_.day))||99)}),selTot=u===null?0:U.reduce((D,J)=>{var N;return D+((((N=Oc(J,u))==null?void 0:N.amount))||0)},0),w=Array.from({length:12},(D,J)=>O.filter(N=>S(N,J)).length),bqL=bq.trim().toLowerCase(),Uf=bqL?U.filter(D=>(D.name||"").toLowerCase().indexOf(bqL)>-1):U,K=Uf.filter(D=>D.autopay),bt=Uf.filter(D=>!D.autopay),H=O.filter(D=>D.daysLeft!==null&&D.daysLeft<0).length,G={monthly:12,quarterly:4,yearly:1},Mt=O.reduce((D,J)=>D+J.amount*(G[J.frequency]||12),0),Ct=D=>"\u20B9"+D.toLocaleString(void 0,{maximumFractionDigits:0});return o.default.createElement("div",{style:{padding:"16px"}},o.default.createElement("div",{style:{position:"sticky",top:0,zIndex:40,background:"rgba(236,240,247,0.92)",backdropFilter:"blur(24px)",WebkitBackdropFilter:"blur(24px)",margin:"-16px -16px 14px",padding:"16px 16px 6px"}},o.default.createElement("div",{style:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"16px",paddingTop:"4px"}},o.default.createElement("div",null,o.default.createElement("div",{style:{fontSize:"22px",fontWeight:"700",color:c.ink,letterSpacing:"-0.03em",lineHeight:1.15}},"Payments"),o.default.createElement("div",{style:{fontSize:"13px",color:pTab==="spend"?c.blue:pTab==="cards"?(cb.some(x2=>!x2.paid)?c.red:c.blue):H>0?c.red:c.blue,fontWeight:"600",marginTop:"1px"}},pTab==="spend"?(()=>{let ms=spendMonths()[0];if(!ms)return"Nothing logged yet";let tt=allSpends().filter(z2=>z2.month===ms).reduce((q,z2)=>q+z2.amount,0);return fmtINR(tt)+" in "+monthLabel(ms)})():pTab==="cards"?(cb.length===0?"No card bills yet":(()=>{let up=cb.filter(x2=>!x2.paid);return up.length?`${up.length} unpaid`:"All settled"})()):l.length===0?"No bills tracked yet":H>0?`${H} overdue`:"All caught up")),o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"8px",flexShrink:0}},pTab==="subs"&&(o.default.createElement("button",{className:"p",title:"All bills",onClick:()=>r(null),style:{width:"36px",height:"36px",borderRadius:"50%",border:u===null?"none":"0.5px solid rgba(255,255,255,0.6)",background:u===null?"linear-gradient(135deg,#007aff,#0051d5)":"rgba(255,255,255,0.55)",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",color:u===null?"#fff":c.inkFaint,boxShadow:u===null?"0 2px 10px rgba(0,122,255,0.45)":"0 2px 8px rgba(31,38,135,0.06)"}},o.default.createElement("svg",{width:"16",height:"16",viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:"2",strokeLinecap:"round",strokeLinejoin:"round"},o.default.createElement("path",{d:"M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1z"}),o.default.createElement("line",{x1:"8",y1:"8",x2:"16",y2:"8"}),o.default.createElement("line",{x1:"8",y1:"12",x2:"16",y2:"12"}),o.default.createElement("line",{x1:"8",y1:"16",x2:"12",y2:"16"})))),o.default.createElement("button",{className:"p",onClick:()=>pTab==="spend"?setSpendAdd(q=>q+1):pTab==="cards"?(setCbEditId(null),setCbName(""),setCbMonth(e.toISOString().slice(0,7)),setCbTotal(""),setCbMain(""),setCbAddon(""),setCbDue(""),setCbMin(""),setCbCats([{label:"",amount:""}]),setCbTxns([]),setPdfOk(""),setPdfErr(""),setCa(!0)):i(!0),style:{width:"36px",height:"36px",borderRadius:"50%",border:"none",background:"linear-gradient(135deg,#007aff,#0051d5)",cursor:"pointer",fontSize:"22px",display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontWeight:"300",lineHeight:1,boxShadow:"0 2px 10px rgba(0,122,255,0.45),inset 0 1px 0 rgba(255,255,255,0.3)",flexShrink:0}},"+"),o.default.createElement(HeaderAvatar,{onClick:onAvatar}))),o.default.createElement("div",{style:{background:"rgba(118,118,128,0.12)",borderRadius:"11px",padding:"3px",display:"flex",gap:"2px",marginBottom:"14px"}},[["subs","Subscriptions"],["cards","Card Bills"],["spend","Spending"]].map(([v,k2])=>o.default.createElement("button",{key:v,className:"seg",onClick:()=>setPTab(v),style:{background:pTab===v?"rgba(255,255,255,0.95)":"transparent",color:pTab===v?c.ink:"rgba(60,60,67,0.6)",boxShadow:pTab===v?"0 2px 8px rgba(0,0,0,0.12), 0 0.5px 1px rgba(0,0,0,0.08)":"none",fontWeight:pTab===v?"600":"400"}},k2))),pTab==="subs"&&l.length>0&&o.default.createElement("div",{style:{display:"flex",gap:"8px",marginBottom:"14px"}},o.default.createElement("div",{style:{flex:1,background:"rgba(255,255,255,0.55)",backdropFilter:"blur(20px) saturate(1.8)",WebkitBackdropFilter:"blur(20px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"16px",padding:"12px",boxShadow:"0 4px 16px rgba(31,38,135,0.05)"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:c.inkFaint,textTransform:"uppercase",letterSpacing:"0.03em"}},"Per Year"),o.default.createElement("div",{style:{fontSize:"19px",fontWeight:"800",color:c.ink,letterSpacing:"-0.02em",marginTop:"2px"}},o.default.createElement(CountUp,{v:Mt,fmt:Ct})),o.default.createElement("div",{style:{fontSize:"10px",color:c.inkFaint,marginTop:"2px"}},l.length," bill",l.length===1?"":"s")),o.default.createElement("div",{style:{flex:1,background:"rgba(255,255,255,0.55)",backdropFilter:"blur(20px) saturate(1.8)",WebkitBackdropFilter:"blur(20px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"16px",padding:"12px",boxShadow:"0 4px 16px rgba(31,38,135,0.05)"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:c.inkFaint,textTransform:"uppercase",letterSpacing:"0.03em"}},u===null?"This Month":Mo[u]+(by===e.getFullYear()?"":" "+by)),o.default.createElement("div",{style:{fontSize:"19px",fontWeight:"800",color:u===null?c.inkFaint:c.ink,letterSpacing:"-0.02em",marginTop:"2px"}},u===null?"\u2014":o.default.createElement(CountUp,{v:selTot,fmt:Ct})),u!==null&&o.default.createElement("div",{style:{fontSize:"10px",color:c.inkFaint,marginTop:"2px"}},U.length," bill",U.length===1?"":"s"))),pTab==="subs"&&l.length>0&&o.default.createElement("div",{style:{background:"rgba(255,255,255,0.55)",backdropFilter:"blur(24px) saturate(1.8)",WebkitBackdropFilter:"blur(24px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"18px",padding:"12px 14px",marginBottom:"14px",boxShadow:"0 8px 24px rgba(31,38,135,0.06), inset 0 1px 0 rgba(255,255,255,0.6)",overflowX:"auto"}},o.default.createElement("div",{style:{display:"flex",alignItems:"center",justifyContent:"center",gap:"14px",marginBottom:"8px"}},o.default.createElement("button",{className:"p",onClick:()=>setBy(by-1),style:{width:"24px",height:"24px",borderRadius:"50%",border:"none",background:c.bg,cursor:"pointer",color:c.inkFaint,fontSize:"13px",display:"flex",alignItems:"center",justifyContent:"center"}},"\u2039"),o.default.createElement("span",{style:{fontSize:"13px",fontWeight:"700",color:c.ink,minWidth:"44px",textAlign:"center"}},by),o.default.createElement("button",{className:"p",onClick:()=>setBy(by+1),style:{width:"24px",height:"24px",borderRadius:"50%",border:"none",background:c.bg,cursor:"pointer",color:c.inkFaint,fontSize:"13px",display:"flex",alignItems:"center",justifyContent:"center"}},"\u203A")),o.default.createElement("div",{style:{display:"flex",gap:"8px",width:"max-content",alignItems:"flex-end"}},D1.map((D,J)=>{let N=w[J],_=J===u;return o.default.createElement("div",{key:J,className:"p",onClick:()=>r(_?null:J),style:{display:"flex",flexDirection:"column",alignItems:"center",gap:"3px",cursor:"pointer",minWidth:"30px"}},o.default.createElement("div",{style:{fontSize:"9px",color:_?c.ink:c.inkFaint,fontStyle:_?"italic":"normal",fontWeight:_?"600":"400"}},D),o.default.createElement("div",{style:{width:"28px",height:"3px",background:_?c.ink:N>0?c.green:c.borderLt,transition:"all 0.15s"}}),N>0&&o.default.createElement("div",{style:{fontSize:"9px",color:_?c.ink:c.green}},N))})))),pTab==="subs"&&o.default.createElement(o.default.Fragment,null,a?o.default.createElement(MSheet,{title:"New Bill",onClose:()=>i(!1),onSave:C,canSave:!!f.trim(),saveLabel:"Add"},o.default.createElement(MField,{label:"Name",value:f,onChange:g,autoFocus:!0,onEnter:C,placeholder:"e.g. Netflix, BSES Electricity"}),o.default.createElement(MPair,null,o.default.createElement(MField,{label:"Amount",value:y,onChange:b,type:"number",inputMode:"decimal",prefix:"\u20B9"}),o.default.createElement(MField,{label:"Next due date",type:"date",value:h,onChange:v})),o.default.createElement(MChips,{label:"Category",options:Eo,value:k,onChange:E}),o.default.createElement(MChips,{label:"Frequency",options:_1,value:M,onChange:s}),o.default.createElement(MField,{label:"Notes (optional)",value:x,onChange:m,multiline:!0}),o.default.createElement(MSwitch,{label:"Autopay enabled",sub:"Charged automatically \u2014 nothing for you to do",value:d,onChange:()=>p(D=>!D)})):null,l.length===0&&!a&&o.default.createElement("div",{style:{textAlign:"center",padding:"40px 20px"}},o.default.createElement("div",{style:{fontSize:"14px",fontWeight:"500",color:c.inkMid,marginBottom:"4px"}},"No bills yet"),o.default.createElement("div",{style:{fontSize:"12px",color:c.inkFaint}},"Track subscriptions, utilities, rent \u2014 anything recurring.")),l.length>0&&o.default.createElement(o.default.Fragment,null,u!==null&&o.default.createElement("div",{style:{fontSize:"13px",color:c.inkFaint,marginBottom:"12px"}},Mo[u]," \u2014 ",o.default.createElement("span",{style:{color:c.green,fontWeight:"600"}},U.length)," bill",U.length===1?"":"s"),u===null&&l.length>0&&(()=>{let G2={monthly:12,quarterly:4,yearly:1},segs=Eo.map(ct=>({ct,amt:l.filter(D=>(D.category||"other")===ct.id).reduce((s2,D)=>s2+(Number(D.amount)||0)*(G2[D.frequency]||12),0)})).filter(s2=>s2.amt>0).sort((a2,b2)=>b2.amt-a2.amt),tot=segs.reduce((s2,x2)=>s2+x2.amt,0);if(!tot)return null;let CF=2*Math.PI*40,acc=0;return o.default.createElement("div",{style:{background:"rgba(255,255,255,0.55)",backdropFilter:"blur(24px) saturate(1.8)",WebkitBackdropFilter:"blur(24px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"18px",padding:"14px",marginBottom:"14px",boxShadow:"0 8px 24px rgba(31,38,135,0.06), inset 0 1px 0 rgba(255,255,255,0.6)",display:"flex",alignItems:"center",gap:"14px"}},o.default.createElement("div",{style:{position:"relative",width:"104px",height:"104px",flexShrink:0}},o.default.createElement("svg",{width:"104",height:"104",viewBox:"0 0 100 100",style:{transform:"rotate(-90deg)"}},o.default.createElement("circle",{cx:"50",cy:"50",r:"40",fill:"none",stroke:"rgba(60,60,67,0.08)",strokeWidth:"13"}),segs.map((s2,i2)=>{let fr2=s2.amt/tot,dash=Math.max(0,fr2*CF-1.5),off=-acc*CF;return acc+=fr2,o.default.createElement("circle",{key:i2,cx:"50",cy:"50",r:"40",fill:"none",stroke:s2.ct.color,strokeWidth:"13",strokeDasharray:dash+" "+(CF-dash),strokeDashoffset:off})})),o.default.createElement("div",{style:{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}},o.default.createElement("div",{style:{fontSize:"12px",fontWeight:"800",color:c.ink,letterSpacing:"-0.02em"}},Ct(tot)),o.default.createElement("div",{style:{fontSize:"8px",fontWeight:"600",color:c.inkFaint,textTransform:"uppercase"}},"per year"))),o.default.createElement("div",{style:{flex:1,minWidth:0}},segs.map((s2,i2)=>o.default.createElement("div",{key:i2,style:{display:"flex",alignItems:"center",gap:"7px",marginBottom:i2===segs.length-1?0:"7px"}},o.default.createElement("span",{style:{width:"9px",height:"9px",borderRadius:"3px",background:s2.ct.color,flexShrink:0}}),o.default.createElement("span",{style:{flex:1,fontSize:"11px",fontWeight:"600",color:c.ink,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}},s2.ct.label),o.default.createElement("span",{style:{fontSize:"10px",color:c.inkFaint,fontWeight:"600"}},Math.round(s2.amt/tot*100),"%"),o.default.createElement("span",{style:{fontSize:"11px",fontWeight:"700",color:c.ink,minWidth:"52px",textAlign:"right"}},Ct(s2.amt)))))
+)})(),l.length>3&&o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"8px",background:"rgba(255,255,255,0.7)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"12px",padding:"8px 12px",marginBottom:"12px",backdropFilter:"blur(10px)",WebkitBackdropFilter:"blur(10px)"}},o.default.createElement("svg",{width:"14",height:"14",viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:"2",strokeLinecap:"round",strokeLinejoin:"round",style:{flexShrink:0,color:c.inkFaint}},o.default.createElement("circle",{cx:"11",cy:"11",r:"8"}),o.default.createElement("line",{x1:"21",y1:"21",x2:"16.65",y2:"16.65"})),o.default.createElement("input",{value:bq,onChange:D=>setBq(D.target.value),placeholder:"Search bills\u2026",style:{flex:1,border:"none",outline:"none",background:"transparent",fontSize:"13px",color:c.ink,fontFamily:"inherit",minWidth:0,padding:"7px 0",minHeight:"30px"}}),bq&&o.default.createElement("button",{className:"p",onClick:()=>setBq(""),style:{border:"none",background:"transparent",color:c.inkFaint,fontSize:"14px",cursor:"pointer",padding:0,flexShrink:0}},"\u2715")),bt.length>0&&o.default.createElement("div",{style:{marginBottom:"18px"}},o.default.createElement("div",{style:{fontSize:"11px",fontWeight:"700",color:c.inkMid,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:"10px",display:"flex",alignItems:"center",gap:"6px"}},o.default.createElement("svg",{width:"12",height:"12",viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:"2",strokeLinecap:"round",strokeLinejoin:"round"},o.default.createElement("path",{d:"M21 8V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-2"}),o.default.createElement("path",{d:"M21 12H7"}),o.default.createElement("path",{d:"M15 8l4 4-4 4"})),"Need to Pay \u2014 ",bt.length),o.default.createElement("div",{style:{display:"flex",flexDirection:"column",gap:"8px"}},bt.map(D=>o.default.createElement(E1,{key:D.id,bill:D,fmtMoney:Ct,onMarkPaid:()=>B(D),onDelete:()=>z(D.id),onUpdate:J=>A(D.id,J)})))),K.length>0&&o.default.createElement("div",null,o.default.createElement("div",{style:{fontSize:"11px",fontWeight:"700",color:c.inkMid,textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:"10px",display:"flex",alignItems:"center",gap:"6px"}},o.default.createElement("svg",{width:"12",height:"12",viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:"2",strokeLinecap:"round",strokeLinejoin:"round"},o.default.createElement("polyline",{points:"20 6 9 17 4 12"})),"Autopay \u2014 ",K.length),o.default.createElement("div",{style:{display:"flex",flexDirection:"column",gap:"8px"}},K.map(D=>o.default.createElement(E1,{key:D.id,bill:D,fmtMoney:Ct,onDelete:()=>z(D.id),onUpdate:J=>A(D.id,J)})))),u!==null&&U.length===0&&o.default.createElement("div",{style:{textAlign:"center",padding:"32px 20px",color:c.inkFaint,fontSize:"13px"}},"Nothing due or paid in ",Mo[u],"."))),pTab==="spend"&&o.default.createElement(SpendingTab,{today:e,addTick:spendAdd}),pTab==="cards"&&o.default.createElement(o.default.Fragment,null,ca?o.default.createElement(MSheet,{title:cbEditId?"Edit Card Statement":"New Card Statement",onClose:()=>{setCa(!1),setCbTxns([]),setCbDue(""),setCbMin(""),setCbEditId(null),setPdfErr(""),setPdfOk("")},onSave:CA,canSave:!!(cbName.trim()&&Number(cbTotal)>0),saveLabel:cbEditId?"Save":"Save"},o.default.createElement("input",{ref:pdfInputRef,type:"file",accept:"application/pdf",style:{display:"none"},onChange:onPdfSelected}),o.default.createElement("button",{className:"p",onClick:()=>pdfInputRef.current&&pdfInputRef.current.click(),disabled:pdfBusy,style:{width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:"8px",padding:"12px",border:"1.5px dashed "+c.blue,borderRadius:"12px",background:c.blueBg,color:c.blue,fontSize:"13px",fontWeight:"600",cursor:pdfBusy?"default":"pointer",marginBottom:"6px",opacity:pdfBusy?.6:1}},"\u{1F4C4} ",pdfBusy?"Reading statement\u2026":"Upload Statement (PDF) \u2014 auto-fill"),pdfErr&&o.default.createElement("div",{style:{fontSize:"11px",color:c.red,marginBottom:"8px"}},pdfErr),pdfOk&&o.default.createElement("div",{style:{fontSize:"11px",fontWeight:"600",color:"#1e8e3e",marginBottom:"8px"}},"\u2713 ",pdfOk),o.default.createElement("div",{style:{display:"flex",alignItems:"center",gap:"8px",margin:"4px 0 14px"}},o.default.createElement("div",{style:{flex:1,height:"1px",background:c.borderLt}}),o.default.createElement("span",{style:{fontSize:"9px",color:c.inkFaint,fontWeight:"700",letterSpacing:"0.04em"}},"OR ENTER MANUALLY"),o.default.createElement("div",{style:{flex:1,height:"1px",background:c.borderLt}})),o.default.createElement(MField,{label:"Card name",value:cbName,onChange:setCbName,autoFocus:!0,placeholder:"e.g. Kotak Solitaire"}),o.default.createElement(MPair,null,o.default.createElement(MField,{label:"Statement month",type:"month",value:cbMonth,onChange:setCbMonth}),o.default.createElement(MField,{label:"Total due",type:"number",inputMode:"decimal",prefix:"\u20B9",value:cbTotal,onChange:setCbTotal})),o.default.createElement(MPair,null,o.default.createElement(MField,{label:"Main card",type:"number",inputMode:"decimal",prefix:"\u20B9",value:cbMain,onChange:setCbMain}),o.default.createElement(MField,{label:"Add-on card",type:"number",inputMode:"decimal",prefix:"\u20B9",value:cbAddon,onChange:setCbAddon})),o.default.createElement(MPair,null,o.default.createElement(MField,{label:"Payment due date",type:"date",value:cbDue,onChange:setCbDue}),o.default.createElement(MField,{label:"Minimum due",type:"number",inputMode:"decimal",prefix:"\u20B9",value:cbMin,onChange:setCbMin})),o.default.createElement(MSectionLabel,null,"Category breakdown"),o.default.createElement("div",{style:{display:"flex",flexDirection:"column",gap:"6px",marginBottom:"8px"}},cbCats.map((D,J)=>o.default.createElement("div",{key:J,style:{display:"flex",gap:"6px",alignItems:"center"}},o.default.createElement("input",{value:D.label,onChange:N=>CCu(J,"label",N.target.value),placeholder:"Category e.g. Restaurants",style:{flex:2,border:"1px solid "+c.border,borderRadius:"10px",padding:"11px 12px",fontSize:"13px",outline:"none",background:c.bg,color:c.ink,boxSizing:"border-box",minWidth:0,fontFamily:"inherit"}}),o.default.createElement("input",{type:"number",inputMode:"decimal",value:D.amount,onChange:N=>CCu(J,"amount",N.target.value),placeholder:"₹",style:{flex:1,border:"1px solid "+c.border,borderRadius:"10px",padding:"11px 12px",fontSize:"13px",outline:"none",background:c.bg,color:c.ink,boxSizing:"border-box",minWidth:0,fontFamily:"inherit"}}),o.default.createElement("button",{className:"p",onClick:()=>CCr(J),title:"Remove",style:{width:"36px",height:"36px",borderRadius:"50%",border:"none",background:c.bgCard,color:c.inkFaint,cursor:"pointer",fontSize:"15px",flexShrink:0,fontFamily:"inherit"}},"×")))),o.default.createElement("button",{className:"p",onClick:CCa,style:{width:"100%",minHeight:"44px",padding:"12px",border:"1px dashed "+c.border,borderRadius:"12px",background:"transparent",color:c.blue,fontSize:"13px",fontWeight:"600",cursor:"pointer",marginBottom:"6px",fontFamily:"inherit"}},"+ Add category")):null,findings.length>0&&!ca&&o.default.createElement("div",{style:{background:"rgba(255,255,255,0.55)",backdropFilter:"blur(24px) saturate(1.8)",WebkitBackdropFilter:"blur(24px) saturate(1.8)",border:"0.5px solid rgba(255,204,0,0.4)",borderRadius:"18px",padding:"14px",marginBottom:"14px",boxShadow:"0 8px 24px rgba(31,38,135,0.06), inset 0 1px 0 rgba(255,255,255,0.6)"}},o.default.createElement("div",{style:{fontSize:"10px",fontWeight:"700",color:"#8a6a00",textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:"10px"}},"\u{1F50E} Smart findings \u00b7 "+findings.length),findings.slice(0,6).map((fd,i2)=>{let brand=hy(fd.merchant)||vy(fd.merchant),title=fd.type==="untracked"?fd.merchant:fd.type==="price"?fd.billName||fd.merchant:fd.merchant,sub=fd.type==="untracked"?("Charged "+fd.months+" months \u00b7 ~"+Ct(fd.amount)+"/mo \u00b7 not tracked"):fd.type==="price"?("Price changed "+Ct(fd.oldAmount)+" \u2192 "+Ct(fd.newAmount)):(fd.count+"\u00d7 "+Ct(fd.amount)+" on "+fmtStmtDate(fd.date));return o.default.createElement("div",{key:fd.id,style:{display:"flex",alignItems:"center",gap:"10px",padding:"7px 0",borderTop:i2===0?"none":"0.5px solid rgba(60,60,67,0.07)"}},o.default.createElement("div",{style:{width:"28px",height:"28px",borderRadius:"9px",background:brand.bg,color:brand.fg,display:"flex",alignItems:"center",justifyContent:"center",fontSize:brand.mark.length>2?"8px":"11px",fontWeight:"800",flexShrink:0}},brand.mark),o.default.createElement("div",{style:{flex:1,minWidth:0}},o.default.createElement("div",{style:{fontSize:"12.5px",fontWeight:"600",color:c.ink,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}},title),o.default.createElement("div",{style:{fontSize:"10px",color:fd.type==="duplicate"?c.red:c.inkFaint,marginTop:"1px",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}},sub)),fd.type==="untracked"&&o.default.createElement("button",{className:"p",onClick:()=>FAdd(fd),style:{padding:"5px 11px",border:"none",borderRadius:"999px",background:c.blue,color:"#fff",fontSize:"11px",fontWeight:"700",cursor:"pointer",flexShrink:0}},"Track"),fd.type==="price"&&o.default.createElement("button",{className:"p",onClick:()=>FUpd(fd),style:{padding:"5px 11px",border:"none",borderRadius:"999px",background:c.blue,color:"#fff",fontSize:"11px",fontWeight:"700",cursor:"pointer",flexShrink:0}},"Update"),o.default.createElement("button",{className:"p",onClick:()=>FH(fd.id),style:{width:"24px",height:"24px",border:"none",borderRadius:"50%",background:c.bg,color:c.inkFaint,fontSize:"12px",cursor:"pointer",flexShrink:0}},"\xD7"))})),cb.length>0&&!ca&&cardNames.length>1&&o.default.createElement("div",{style:{display:"flex",gap:"6px",overflowX:"auto",marginBottom:"12px",paddingBottom:"2px"}},[{id:null,label:"All cards"}].concat(cardNames.map(nm=>({id:nm,label:nm}))).map((cd,i2)=>{let on=cardSel===cd.id;return o.default.createElement("button",{key:i2,className:"p",onClick:()=>setCardSel(cd.id),style:{flexShrink:0,border:"none",cursor:"pointer",fontSize:"11px",fontWeight:"700",padding:"6px 12px",borderRadius:"999px",background:on?"linear-gradient(135deg,#007aff,#0051d5)":"rgba(255,255,255,0.7)",color:on?"#fff":c.ink,boxShadow:on?"0 2px 8px rgba(0,122,255,0.35)":"0 1px 4px rgba(31,38,135,0.08)",maxWidth:"150px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},cd.label)})),cbView.length>1&&!ca&&(()=>{let mAgg={};cbView.forEach(x2=>{if(!x2.month)return;mAgg[x2.month]=(mAgg[x2.month]||0)+(Number(x2.total)||0)});let series=Object.keys(mAgg).sort().slice(-6).map(k2=>({month:k2,total:mAgg[k2]})),mx=Math.max.apply(null,series.map(x2=>x2.total))||1;return o.default.createElement("div",{style:{background:"rgba(255,255,255,0.55)",backdropFilter:"blur(24px) saturate(1.8)",WebkitBackdropFilter:"blur(24px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"18px",padding:"14px",marginBottom:"14px",boxShadow:"0 8px 24px rgba(31,38,135,0.06), inset 0 1px 0 rgba(255,255,255,0.6)"}},o.default.createElement("div",{style:{fontSize:"10px",fontWeight:"700",color:c.inkFaint,textTransform:"uppercase",letterSpacing:"0.04em",marginBottom:"12px"}},"Spend trend"),o.default.createElement("div",{style:{display:"flex",gap:"8px",alignItems:"flex-end",height:"92px"}},series.map((st,i2)=>{let h=Math.max(4,Math.round((Number(st.total)||0)/mx*62)),last=i2===series.length-1,lb=st.month?D1[Number(st.month.split("-")[1])-1]:"";return o.default.createElement("div",{key:i2,style:{flex:1,display:"flex",flexDirection:"column",alignItems:"center",gap:"4px",height:"100%",justifyContent:"flex-end"}},o.default.createElement("div",{style:{fontSize:"8.5px",fontWeight:"700",color:last?c.ink:c.inkFaint,whiteSpace:"nowrap"}},Ct(Number(st.total)||0)),o.default.createElement("div",{style:{width:"100%",maxWidth:"38px",height:h+"px",borderRadius:"7px",background:last?"linear-gradient(180deg,#3FA8FF,#0A7CFF)":"rgba(10,124,255,0.28)"}}),o.default.createElement("div",{style:{fontSize:"9px",fontWeight:last?"800":"500",color:last?c.ink:"rgba(60,60,67,0.5)"}},lb))})))})(),cbView.length>0&&!ca&&(()=>{let mAgg2={};cbView.forEach(x2=>{if(!x2.month)return;mAgg2[x2.month]=(mAgg2[x2.month]||0)+(Number(x2.total)||0)});let mKeys=Object.keys(mAgg2).sort(),latest=mKeys.length?{month:mKeys[mKeys.length-1],total:mAgg2[mKeys[mKeys.length-1]]}:null,prev=mKeys.length>1?{month:mKeys[mKeys.length-2],total:mAgg2[mKeys[mKeys.length-2]]}:null,allTot=cbView.reduce((s2,x2)=>s2+(Number(x2.total)||0),0),unpaid=cbView.filter(x2=>!x2.paid),unpaidTot=unpaid.reduce((s2,x2)=>s2+(Number(x2.total)||0),0),diff=prev?latest.total-prev.total:null,diffPct=prev&&prev.total?Math.round((latest.total-prev.total)/prev.total*100):null,mLab=latest&&latest.month?(()=>{let p2=latest.month.split("-");return Mo[Number(p2[1])-1]})():"Latest";if(!latest)return null;return o.default.createElement("div",{style:{display:"flex",gap:"8px",marginBottom:"14px"}},o.default.createElement("div",{style:{flex:1,background:"rgba(255,255,255,0.55)",backdropFilter:"blur(20px) saturate(1.8)",WebkitBackdropFilter:"blur(20px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"16px",padding:"12px",boxShadow:"0 4px 16px rgba(31,38,135,0.05)"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:c.inkFaint,textTransform:"uppercase",letterSpacing:"0.03em"}},mLab),o.default.createElement("div",{style:{fontSize:"19px",fontWeight:"800",color:c.ink,letterSpacing:"-0.02em",marginTop:"2px"}},o.default.createElement(CountUp,{v:latest.total,fmt:Ct})),diff!==null?o.default.createElement("div",{style:{fontSize:"10px",fontWeight:"700",color:diff>0?c.red:"#1e8e3e",marginTop:"2px"}},(diff>0?"\u25B2 +":"\u25BC ")+Ct(Math.abs(diff))+(diffPct!==null?" ("+(diff>0?"+":"")+diffPct+"%)":"")):o.default.createElement("div",{style:{fontSize:"10px",color:c.inkFaint,marginTop:"2px"}},"first month")),o.default.createElement("div",{style:{flex:1,background:"rgba(255,255,255,0.55)",backdropFilter:"blur(20px) saturate(1.8)",WebkitBackdropFilter:"blur(20px) saturate(1.8)",border:"0.5px solid rgba(255,255,255,0.6)",borderRadius:"16px",padding:"12px",boxShadow:"0 4px 16px rgba(31,38,135,0.05)"}},o.default.createElement("div",{style:{fontSize:"9px",fontWeight:"600",color:unpaid.length?c.red:c.inkFaint,textTransform:"uppercase",letterSpacing:"0.03em"}},unpaid.length?"Unpaid":"All settled"),o.default.createElement("div",{style:{fontSize:"19px",fontWeight:"800",color:unpaid.length?c.red:"#1e8e3e",letterSpacing:"-0.02em",marginTop:"2px"}},unpaid.length?o.default.createElement(CountUp,{v:unpaidTot,fmt:Ct}):"\u2713"),o.default.createElement("div",{style:{fontSize:"10px",color:c.inkFaint,marginTop:"2px"}},unpaid.length?unpaid.length+" statement"+(unpaid.length===1?"":"s"):cbView.length+" statement"+(cbView.length===1?"":"s")+" tracked")))})(),cb.length===0&&!ca&&o.default.createElement("div",{style:{textAlign:"center",padding:"40px 20px"}},o.default.createElement("div",{style:{fontSize:"14px",fontWeight:"500",color:c.inkMid,marginBottom:"4px"}},"No card statements yet"),o.default.createElement("div",{style:{fontSize:"12px",color:c.inkFaint}},"Add a monthly statement to track totals and category spend.")),cb.length>0&&o.default.createElement("div",{style:{display:"flex",flexDirection:"column",gap:"12px"}},(()=>{let seen={},names=[];cbSorted.forEach(z2=>{let kk=merchKey(z2.cardName);if(!seen[kk]){seen[kk]=1,names.push(z2.cardName)}});return names.map(nm=>o.default.createElement(WaiverCard,{key:"w"+nm,cardName:nm,today:e,onEdit:()=>setMetaCard(nm)}))})(),metaCard?o.default.createElement(CardMetaSheet,{cardName:metaCard,today:e,onClose:()=>setMetaCard(null)}):null,merchOpen?o.default.createElement(MerchantSheet,{merchant:merchOpen,today:e,onClose:()=>setMerchOpen(null),onSplit:sp=>{setMerchOpen(null),setSplitOpen(sp)}}):null,splitOpen?o.default.createElement(SplitSheet,{spend:splitOpen,onClose:()=>setSplitOpen(null)}):null,cbSorted.map((D,ix9)=>o.default.createElement(Ky,{key:D.id,entry:D,fmtMoney:Ct,onDelete:()=>CD(D.id),onTogglePaid:()=>CP(D.id),onEdit:()=>CE(D),onMerchant:mn=>setMerchOpen(mn),prevEntry:cbSorted.slice(ix9+1).find(z2=>z2.cardName===D.cardName)||null,defaultOpen:ix9===0})))))}var CARD_CITIES = ["NEW DELHI","NEWDELHI","SOUTH DELHI","GURUGRAM","GURGAON","BENGALURU URB","BENGALURU","BANGALORE","MUMBAI","NAVI MUMBAI","DELHI","HYDERABAD","PUNE","CHENNAI","KOLKATA","NOIDA","GHAZIABAD","FARIDABAD","AHMEDABAD","JAIPUR","CHANDIGARH","KOCHI","THANE","LUCKNOW","INDORE","SURAT","GOA","LONDON","SINGAPORE","DUBAI"];
 var CARD_ALIASES = {
   "ASSPL":"Amazon","AMAZONIN":"Amazon","AMAZON PAY":"Amazon Pay",
   "BUNDL TECHNOLOGIES":"Swiggy","BLINK COMMERCE PVT LTD":"Blinkit","BLINK COMMERCE":"Blinkit","BLINKIT":"Blinkit",
@@ -1937,10 +2581,15 @@ function cleanMerchant(raw) {
   return { name: s || "—", emi: emi };
 }
 
-function TxRow({ tx, fmtMoney, showSection }) {
+function TxRow({ tx, fmtMoney, showSection, onOpen }) {
   var brand = hy(tx.clean) || vy(tx.clean);
-  return o.default.createElement("div", {
-    style: { display: "grid", gridTemplateColumns: "26px 1fr auto", alignItems: "center", columnGap: "10px", height: "46px" }
+  var rule = readRules()[merchKey(tx.clean)];
+  return o.default.createElement(onOpen ? "button" : "div", {
+    className: onOpen ? "p" : undefined,
+    onClick: onOpen ? function () { onOpen(tx.clean); } : undefined,
+    style: { display: "grid", gridTemplateColumns: "26px 1fr auto", alignItems: "center", columnGap: "10px", height: "46px",
+      width: "100%", border: "none", background: "transparent", padding: 0, textAlign: "left",
+      fontFamily: "inherit", cursor: onOpen ? "pointer" : "default" }
   },
     o.default.createElement("div", {
       style: {
@@ -1954,7 +2603,7 @@ function TxRow({ tx, fmtMoney, showSection }) {
         style: { fontSize: "12.5px", fontWeight: "500", color: c.ink, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", lineHeight: 1.3 }
       }, tx.clean),
       o.default.createElement("div", { style: { display: "flex", gap: "5px", alignItems: "center", marginTop: "3px" } },
-        o.default.createElement("span", { style: { fontSize: "9px", fontWeight: "600", color: c.inkFaint, whiteSpace: "nowrap" } }, tx.category),
+        o.default.createElement("span", { style: { fontSize: "9px", fontWeight: "600", color: c.inkFaint, whiteSpace: "nowrap" } }, rule || tx.category),
         showSection && o.default.createElement("span", { style: { fontSize: "9px", color: "rgba(60,60,67,0.3)" } }, "·"),
         showSection && o.default.createElement("span", {
           style: { fontSize: "9px", fontWeight: "700", color: tx.section === "addon" ? "#AF52DE" : c.blue, whiteSpace: "nowrap" }
@@ -1984,7 +2633,7 @@ function stmtDueInfo(entry) {
   return { label: "Due in " + days + "d", color: c.inkFaint, bg: c.bg };
 }
 
-function Ky({ entry: t, fmtMoney: e, onDelete: n, onTogglePaid: onPaid, onEdit: onEdit, prevEntry: prevE, defaultOpen: dOpen }) {
+function Ky({ entry: t, fmtMoney: e, onDelete: n, onTogglePaid: onPaid, onEdit: onEdit, prevEntry: prevE, defaultOpen: dOpen, onMerchant: onMerchant }) {
   var bodyS = o.useState(dOpen !== false), bodyOpen = bodyS[0], setBodyOpen = bodyS[1];
   var confirmS = o.useState(false), confirmDel = confirmS[0], setConfirmDel = confirmS[1];
   var txOpenS = o.useState(true), txOpen = txOpenS[0], setTxOpen = txOpenS[1];
@@ -2245,7 +2894,7 @@ function Ky({ entry: t, fmtMoney: e, onDelete: n, onTogglePaid: onPaid, onEdit: 
             g.date && o.default.createElement("div", { style: { fontSize: "10.5px", fontWeight: "700", color: c.ink, marginBottom: "2px", letterSpacing: "0.02em" } }, fmtStmtDate(g.date)),
             g.items.map(function (tx, ti) {
               return o.default.createElement("div", { key: ti, style: { borderTop: ti === 0 ? "none" : "0.5px solid rgba(60,60,67,0.07)" } },
-                o.default.createElement(TxRow, { tx: tx, fmtMoney: e, showSection: hasAddon })
+                o.default.createElement(TxRow, { tx: tx, fmtMoney: e, showSection: hasAddon, onOpen: onMerchant })
               );
             })
           );
