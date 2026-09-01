@@ -2597,6 +2597,30 @@ function YearReview({ habits, checks, today, onClose }) {
       big(fmtINRShort(r.spendTotal), "Tracked spend", "#af52de"),
       big(r.topCat ? fmtINRShort(r.topCat.amount) : "–", r.topCat ? "Most on " + r.topCat.category : "No categories", "#ff3b30")) : null,
 
+    (function () {
+      var trips = readTrips();
+      var doneTrips = tripsInYear(trips, year).filter(function (t) {
+        return t.status === "done" || (t.end && t.end < isoDay(0, today));
+      });
+      if (!doneTrips.length) return null;
+      var daysAway = 0, longest = null, placeDays = {};
+      doneTrips.forEach(function (t) {
+        var c9 = clipToYear(t, year);
+        var dd = Math.round((new Date(c9.e + "T00:00:00") - new Date(c9.s + "T00:00:00")) / 864e5) + 1;
+        daysAway += dd;
+        placeDays[t.place] = (placeDays[t.place] || 0) + dd;
+        if (!longest || dd > longest.dd) longest = { t: t, dd: dd };
+      });
+      return o.default.createElement("div", { style: { marginBottom: "16px" } },
+        o.default.createElement(MSectionLabel, null, "On the road"),
+        o.default.createElement("div", { style: { display: "flex", gap: "8px", marginBottom: "10px" } },
+          big(doneTrips.length, "Trip" + (doneTrips.length === 1 ? "" : "s"), "#30b0c7"),
+          big(daysAway, "Days away", "#ff9500"),
+          big(Object.keys(placeDays).length, "Place" + (Object.keys(placeDays).length === 1 ? "" : "s"), "#af52de")),
+        longest ? o.default.createElement("div", { style: { fontSize: "13.5px", color: c.ink, lineHeight: 1.5 } },
+          "Longest: ", o.default.createElement("b", null, longest.t.place), " — " + longest.dd + " days") : null);
+    })(),
+
     r.topMerch ? o.default.createElement("div", { style: { marginBottom: "16px" } },
       o.default.createElement(MSectionLabel, null, "Your most-visited"),
       o.default.createElement("div", { style: { fontSize: "15px", color: c.ink, lineHeight: 1.5 } },
@@ -4165,6 +4189,7 @@ function nextTrip(trips, today) {
 function TravelYearStrip({ trips, year, today, onOpen }) {
   var rows = tripsInYear(trips, year);
   var todayIso = isoDay(0, today);
+  var lw = longWeekends(year, trips, today);
   return o.default.createElement("div", {
     style: {
       background: "rgba(255,255,255,0.55)", borderRadius: "18px", padding: "14px",
@@ -4193,6 +4218,21 @@ function TravelYearStrip({ trips, year, today, onOpen }) {
           style: { width: "26px", flexShrink: 0, fontSize: "9.5px", fontWeight: isThisMonth ? "800" : "600", color: isThisMonth ? c.blue : c.inkFaint }
         }, D1[mo]),
         o.default.createElement("div", { style: { flex: 1, position: "relative", height: "16px", background: c.bg, borderRadius: "5px", overflow: "hidden" } },
+          lw.map(function (sp, li) {
+            var sd = new Date(sp.start + "T00:00:00"), ed = new Date(sp.end + "T00:00:00");
+            if (sd.getMonth() > mo || ed.getMonth() < mo) return null;
+            var from = sd.getMonth() === mo ? sd.getDate() : 1;
+            var to = ed.getMonth() === mo ? ed.getDate() : dim;
+            return o.default.createElement("div", {
+              key: "lw" + li,
+              style: {
+                position: "absolute", top: 0, bottom: 0,
+                left: ((from - 1) / dim * 100) + "%",
+                width: (Math.max(1, to - from + 1) / dim * 100) + "%",
+                background: "rgba(255,159,10,0.28)"
+              }
+            });
+          }),
           isThisMonth ? o.default.createElement("div", {
             style: { position: "absolute", left: ((today.getDate() - 1) / dim * 100) + "%", top: 0, bottom: 0, width: "1.5px", background: c.blue, opacity: .6 }
           }) : null,
@@ -4216,11 +4256,12 @@ function TravelYearStrip({ trips, year, today, onOpen }) {
 }
 
 // ---- add / edit a trip -----------------------------------------------------
-function TripSheet({ editing, today, onClose }) {
+function TripSheet({ editing, preset, today, onClose }) {
   var e0 = editing || {};
+  var p0 = preset || {};
   var plS = (0, o.useState)(e0.place || ""), place = plS[0], setPlace = plS[1];
-  var stS = (0, o.useState)(e0.start || ""), start = stS[0], setStart = stS[1];
-  var enS = (0, o.useState)(e0.end || ""), end = enS[0], setEnd = enS[1];
+  var stS = (0, o.useState)(e0.start || p0.start || ""), start = stS[0], setStart = stS[1];
+  var enS = (0, o.useState)(e0.end || p0.end || ""), end = enS[0], setEnd = enS[1];
   var kdS = (0, o.useState)(e0.kind || "leisure"), kind = kdS[0], setKind = kdS[1];
   var suS = (0, o.useState)(e0.status || "planned"), status = suS[0], setStatus = suS[1];
   var bgS = (0, o.useState)(e0.budget ? String(e0.budget) : ""), budget = bgS[0], setBudget = bgS[1];
@@ -4384,6 +4425,12 @@ function TravelTab({ onAvatar, today }) {
 
     o.default.createElement(TravelYearStrip, { trips: trips, year: year, today: today, onOpen: function (t) { setSheet({ editing: t }); } }),
 
+    o.default.createElement(LongWeekendCard, {
+      year: year, trips: trips, today: today,
+      onPlan: function (sp) { setSheet({ editing: null, preset: { start: sp.start, end: sp.end } }); },
+      onManage: function () { setSheet({ holidays: true }); }
+    }),
+
     upcoming.length ? card([
       o.default.createElement("div", { key: "h", style: { fontSize: "10px", fontWeight: "700", color: c.inkFaint, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "6px" } }, "Coming up"),
       upcoming.map(tripRow)
@@ -4402,8 +4449,244 @@ function TravelTab({ onAvatar, today }) {
     !trips.length ? o.default.createElement("div", { style: { textAlign: "center", padding: "36px 20px", color: c.inkFaint, fontSize: "13px", lineHeight: 1.7 } },
       "Add where you're going — or dreaming of going.", o.default.createElement("br", null), "The year strip above fills in as you plan.") : null,
 
-    sheet ? o.default.createElement(TripSheet, { editing: sheet.editing, today: today, onClose: function () { setSheet(null); } }) : null
+    sheet && sheet.holidays ? o.default.createElement(HolidaySheet, { year: year, onClose: function () { setSheet(null); } })
+      : sheet ? o.default.createElement(TripSheet, { editing: sheet.editing, preset: sheet.preset, today: today, onClose: function () { setSheet(null); } }) : null
   );
+}
+
+// ---- Indian holidays & long weekends ---------------------------------------
+// Three sources, in order of certainty:
+//   1. Fixed-date national holidays — computed for any year.
+//   2. Good Friday — Easter is pure arithmetic (Butcher's computus), so this
+//      is exact for any year.
+//   3. Movable festivals (Holi, Dussehra, Diwali, the Eids) — a curated table
+//      for the years we can vouch for; Eid depends on moon sighting and is
+//      flagged approximate even then.
+// On top of all of it the list is editable, because the long weekend that
+// matters is the one on YOUR office calendar.
+
+var K_HOLIDAYS = "ht_v12_holidays";
+
+function easterSunday(y) {
+  var a = y % 19, b = Math.floor(y / 100), c9 = y % 100;
+  var d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+  var g = Math.floor((b - f + 1) / 3);
+  var h = (19 * a + b - d - g + 15) % 30;
+  var i = Math.floor(c9 / 4), k = c9 % 4;
+  var l = (32 + 2 * e + 2 * i - h - k) % 7;
+  var m = Math.floor((a + 11 * h + 22 * l) / 451);
+  var month = Math.floor((h + l - 7 * m + 114) / 31);
+  var day = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(y, month - 1, day);
+}
+
+// festivals whose dates were checked against published calendars
+var FEST_TABLE = {
+  2026: [
+    ["2026-03-04", "Holi", false],
+    ["2026-03-20", "Eid al-Fitr", true],
+    ["2026-05-27", "Eid al-Adha", true],
+    ["2026-10-20", "Dussehra", true],
+    ["2026-11-08", "Diwali", false]
+  ],
+  2027: [
+    ["2027-03-22", "Holi", true],
+    ["2027-03-10", "Eid al-Fitr", true],
+    ["2027-05-17", "Eid al-Adha", true],
+    ["2027-10-29", "Diwali", false]
+  ]
+};
+
+function seedHolidays(year) {
+  var fixed = [
+    [year + "-01-01", "New Year's Day"],
+    [year + "-01-14", "Makar Sankranti / Pongal"],
+    [year + "-01-26", "Republic Day"],
+    [year + "-04-14", "Ambedkar Jayanti"],
+    [year + "-05-01", "May Day"],
+    [year + "-08-15", "Independence Day"],
+    [year + "-10-02", "Gandhi Jayanti"],
+    [year + "-12-25", "Christmas"]
+  ];
+  var out = fixed.map(function (r) { return { date: r[0], name: r[1], approx: false, src: "seed" }; });
+  var es = easterSunday(year);
+  var gf = new Date(es.getFullYear(), es.getMonth(), es.getDate() - 2);
+  out.push({ date: gf.getFullYear() + "-" + pad2(gf.getMonth() + 1) + "-" + pad2(gf.getDate()), name: "Good Friday", approx: false, src: "seed" });
+  (FEST_TABLE[year] || []).forEach(function (r) {
+    out.push({ date: r[0], name: r[1], approx: !!r[2], src: "seed" });
+  });
+  return out;
+}
+
+function readHolidayEdits() { return lsGet(K_HOLIDAYS, { removed: {}, added: [] }) || { removed: {}, added: [] }; }
+function writeHolidayEdits(v) { lsSet(K_HOLIDAYS, v); storeEmit(K_HOLIDAYS); }
+
+// seeds minus what the user removed, plus what they added
+function effectiveHolidays(year) {
+  var edits = readHolidayEdits();
+  var out = seedHolidays(year).filter(function (h) { return !edits.removed[h.date + "|" + h.name]; });
+  (edits.added || []).forEach(function (h) {
+    if (String(h.date || "").slice(0, 4) === String(year)) out.push({ date: h.date, name: h.name, approx: false, src: "user", id: h.id });
+  });
+  out.sort(function (a, b) { return String(a.date).localeCompare(String(b.date)); });
+  return out;
+}
+
+/**
+ * Long weekends for a year: maximal runs of days off (weekends + holidays),
+ * allowing at most one bridge day of leave. A run must contain a holiday —
+ * otherwise it is just a weekend.
+ */
+function longWeekends(year, trips, today) {
+  var hols = effectiveHolidays(year);
+  var holByIso = {};
+  hols.forEach(function (h) { holByIso[h.date] = h; });
+
+  var isOff = function (d) {
+    var dow = d.getDay();
+    if (dow === 0 || dow === 6) return true;
+    return !!holByIso[d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate())];
+  };
+  var isoOf = function (d) { return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()); };
+
+  // mark every day: 0 work, 1 off, 2 bridge (single working day between offs)
+  var start = new Date(year, 0, 1), days = [];
+  for (var d = new Date(start); d.getFullYear() === year; d.setDate(d.getDate() + 1)) {
+    days.push(new Date(d));
+  }
+  var off = days.map(isOff);
+  var bridge = days.map(function (d, i) {
+    return !off[i] && i > 0 && i < days.length - 1 && off[i - 1] && off[i + 1];
+  });
+
+  var spans = [], i = 0;
+  while (i < days.length) {
+    if (!off[i] && !bridge[i]) { i++; continue; }
+    var j = i, leave = 0;
+    while (j < days.length && (off[j] || (bridge[j] && leave === 0))) {
+      if (bridge[j]) leave++;
+      j++;
+    }
+    var len = j - i;
+    var names = [], approx = false;
+    for (var q = i; q < j; q++) {
+      var h = holByIso[isoOf(days[q])];
+      if (h) { names.push(h.name); if (h.approx) approx = true; }
+    }
+    // 3+ days, at least one actual holiday
+    if (len >= 3 && names.length) {
+      var sIso = isoOf(days[i]), eIso = isoOf(days[j - 1]);
+      var covered = (trips || []).find(function (t) {
+        return t.start && t.end && t.status !== "idea" && t.start <= eIso && t.end >= sIso;
+      });
+      spans.push({ start: sIso, end: eIso, days: len, leave: leave, names: names, approx: approx, covered: covered || null });
+    }
+    i = j;
+  }
+  return spans;
+}
+
+function fmtSpan(sp) {
+  var s = new Date(sp.start + "T00:00:00"), e = new Date(sp.end + "T00:00:00");
+  var same = s.getMonth() === e.getMonth();
+  return s.getDate() + (same ? "" : " " + D1[s.getMonth()]) + "–" + e.getDate() + " " + D1[e.getMonth()];
+}
+
+// ---- manage the holiday list -----------------------------------------------
+function HolidaySheet({ year, onClose }) {
+  useLocal(K_HOLIDAYS, { removed: {}, added: [] });
+  var nS = (0, o.useState)(""), name = nS[0], setName = nS[1];
+  var dS = (0, o.useState)(""), date = dS[0], setDate = dS[1];
+  var hols = effectiveHolidays(year);
+
+  var remove = function (h) {
+    var edits = readHolidayEdits();
+    if (h.src === "user") {
+      edits.added = (edits.added || []).filter(function (x) { return x.id !== h.id; });
+    } else {
+      edits.removed = ot(P({}, edits.removed), {});
+      edits.removed[h.date + "|" + h.name] = 1;
+    }
+    writeHolidayEdits(P({}, edits));
+  };
+  var add = function () {
+    if (!name.trim() || !date) return;
+    var edits = readHolidayEdits();
+    edits.added = (edits.added || []).concat([{ id: Date.now(), name: name.trim(), date: date }]);
+    writeHolidayEdits(P({}, edits));
+    setName(""); setDate("");
+  };
+
+  return o.default.createElement(MSheet, { title: "Holidays · " + year, onClose: onClose },
+    o.default.createElement("div", { style: { fontSize: "12.5px", color: c.inkFaint, lineHeight: 1.55, marginBottom: "14px" } },
+      "Long weekends are found from this list. It starts with national holidays (dates marked ~ depend on the moon and can shift a day) — make it match your office calendar: add what you get, remove what you don't."),
+    hols.map(function (h, i) {
+      var d = new Date(h.date + "T00:00:00");
+      return o.default.createElement("div", { key: i, style: { display: "flex", alignItems: "center", gap: "10px", padding: "9px 0", borderBottom: "0.5px solid " + c.borderLt } },
+        o.default.createElement("div", { style: { flex: 1, minWidth: 0 } },
+          o.default.createElement("div", { style: { fontSize: "14px", color: c.ink } }, h.name + (h.approx ? " ~" : "")),
+          o.default.createElement("div", { style: { fontSize: "11px", color: c.inkFaint, marginTop: "1px" } },
+            w1[d.getDay()] + ", " + d.getDate() + " " + Mo[d.getMonth()] + (h.src === "user" ? " · added by you" : ""))),
+        o.default.createElement("button", {
+          className: "p", title: "Remove", onClick: function () { remove(h); },
+          style: { width: "32px", height: "32px", borderRadius: "50%", border: "none", background: c.bg, color: c.inkFaint, fontSize: "14px", cursor: "pointer", flexShrink: 0, fontFamily: "inherit" }
+        }, "✕"));
+    }),
+    o.default.createElement("div", { style: { height: "14px" } }),
+    o.default.createElement(MSectionLabel, null, "Add a holiday"),
+    o.default.createElement(MPair, null,
+      o.default.createElement(MField, { label: "Name", value: name, onChange: setName, placeholder: "Company day off" }),
+      o.default.createElement(MField, { label: "Date", type: "date", value: date, onChange: setDate })),
+    o.default.createElement("button", {
+      className: "p", onClick: add,
+      style: {
+        width: "100%", minHeight: "46px", borderRadius: "13px", border: "none",
+        background: name.trim() && date ? "linear-gradient(135deg,#30b0c7,#0e8697)" : c.bg,
+        color: name.trim() && date ? "#fff" : c.inkFaint, fontSize: "14px", fontWeight: "700",
+        cursor: "pointer", fontFamily: "inherit"
+      }
+    }, "Add holiday"));
+}
+
+// ---- the long-weekend card ------------------------------------------------
+function LongWeekendCard({ year, trips, today, onPlan, onManage }) {
+  useLocal(K_HOLIDAYS, { removed: {}, added: [] });
+  var todayIso = isoDay(0, today);
+  var spans = longWeekends(year, trips, today)
+    .filter(function (sp) { return year > today.getFullYear() || sp.end >= todayIso; });
+  return o.default.createElement("div", {
+    style: {
+      background: "rgba(255,255,255,0.55)", borderRadius: "18px", padding: "13px 14px", marginBottom: "12px",
+      border: "0.5px solid rgba(255,255,255,0.6)",
+      boxShadow: "0 6px 24px rgba(31,38,135,0.05), inset 0 1px 0 rgba(255,255,255,0.5)",
+      backdropFilter: "blur(24px) saturate(1.8)", WebkitBackdropFilter: "blur(24px) saturate(1.8)"
+    }
+  },
+    o.default.createElement("div", { style: { display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" } },
+      o.default.createElement("span", { style: { flex: 1, minWidth: 0, fontSize: "10px", fontWeight: "700", color: "#b26a00", textTransform: "uppercase", letterSpacing: "0.05em" } },
+        "🌤 Long weekends" + (spans.length ? " · " + spans.length + " left" : "")),
+      o.default.createElement("button", {
+        className: "p", onClick: onManage,
+        style: { border: "none", background: "transparent", color: c.blue, fontSize: "12px", fontWeight: "700", cursor: "pointer", padding: "4px 2px", fontFamily: "inherit", flexShrink: 0 }
+      }, "Holidays")),
+    spans.length === 0
+      ? o.default.createElement("div", { style: { fontSize: "12.5px", color: c.inkFaint } },
+        "None left in " + year + ". Check the holiday list matches your office calendar.")
+      : spans.map(function (sp, i) {
+        return o.default.createElement("div", { key: i, style: { display: "flex", alignItems: "center", gap: "10px", padding: "7px 0", borderTop: i === 0 ? "none" : "0.5px solid " + c.borderLt } },
+          o.default.createElement("div", { style: { flex: 1, minWidth: 0 } },
+            o.default.createElement("div", { style: { fontSize: "13.5px", fontWeight: "600", color: c.ink } },
+              fmtSpan(sp) + " · " + sp.days + " days"),
+            o.default.createElement("div", { style: { fontSize: "11px", color: c.inkFaint, marginTop: "1px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+              sp.names.join(" + ") + (sp.approx ? " ~" : "") + (sp.leave ? " · take 1 day off" : ""))),
+          sp.covered
+            ? o.default.createElement("span", { style: { fontSize: "11px", fontWeight: "700", color: "#1e8e3e", background: "rgba(52,199,89,0.14)", padding: "4px 10px", borderRadius: "999px", flexShrink: 0, maxWidth: "110px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+              "✓ " + sp.covered.place)
+            : o.default.createElement("button", {
+              className: "p", onClick: function () { onPlan(sp); },
+              style: { border: "1px solid #b26a00", borderRadius: "999px", padding: "5px 12px", background: "transparent", color: "#b26a00", fontSize: "11.5px", fontWeight: "700", cursor: "pointer", flexShrink: 0, fontFamily: "inherit" }
+            }, "Plan it"));
+      }));
 }
 
 function MClearBtn(onClick) {
