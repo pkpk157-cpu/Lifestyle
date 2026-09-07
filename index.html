@@ -4343,15 +4343,36 @@ function calTravelEvents(from, to, today) {
   }
   return out;
 }
-function calTravelTints(from, to, today) {
+// Which days a long weekend covers, and where each run begins and ends, so the
+// grid can draw one dotted line around the whole run instead of colouring it in.
+var LW_DASH = "1.5px dashed #c8860a";
+function calTravelMarks(from, to, today) {
   var days = {};
   var y0 = Number(from.slice(0, 4)), y1 = Number(to.slice(0, 4));
   for (var y = y0; y <= y1; y++) {
     longWeekends(y, readTrips(), today).forEach(function (sp) {
-      for (var d = new Date(sp.start + "T00:00:00"); isoOfDate(d) <= sp.end; d.setDate(d.getDate() + 1)) days[isoOfDate(d)] = "rgba(255,159,10,0.16)";
+      for (var d = new Date(sp.start + "T00:00:00"); isoOfDate(d) <= sp.end; d.setDate(d.getDate() + 1)) {
+        var iso = isoOfDate(d);
+        days[iso] = { start: iso === sp.start, end: iso === sp.end };
+      }
     });
   }
   return days;
+}
+
+// The outline for one day of a run. A run that wraps onto the next week is
+// closed at the row edge and reopened on the row below, so the line still
+// reads as one shape.
+function lwEdges(mk, dow) {
+  if (!mk) return null;
+  var left = mk.start || dow === 0, right = mk.end || dow === 6;
+  return {
+    position: "absolute", inset: "1px", pointerEvents: "none",
+    borderTop: LW_DASH, borderBottom: LW_DASH,
+    borderLeft: left ? LW_DASH : "none", borderRight: right ? LW_DASH : "none",
+    borderTopLeftRadius: left ? "8px" : 0, borderBottomLeftRadius: left ? "8px" : 0,
+    borderTopRightRadius: right ? "8px" : 0, borderBottomRightRadius: right ? "8px" : 0
+  };
 }
 
 function calPeopleEvents(from, to, today) {
@@ -4493,7 +4514,7 @@ var CAL_LEGEND = {
 };
 CAL_LEGEND.today = CAL_LEGEND.travel.concat(CAL_LEGEND.people, CAL_LEGEND.payments, CAL_LEGEND.tracker);
 
-function calLegend(tab, events, tints, tint) {
+function calLegend(tab, events, marks, tint) {
   var out = [], present = {};
   (events || []).forEach(function (e) { present[e.lk || e.kind] = 1; });
   // trips carry their own colour, so each one earns its own swatch
@@ -4507,7 +4528,7 @@ function calLegend(tab, events, tints, tint) {
     if (trips.length > 4) out.push({ color: "transparent", label: "+" + (trips.length - 4) + " more", muted: true });
   }
   (CAL_LEGEND[tab] || []).forEach(function (it) { if (present[it.kind]) out.push(it); });
-  if (tints && Object.keys(tints).length) out.push({ color: "rgba(255,159,10,0.45)", label: "Long weekend", block: true });
+  if (marks && Object.keys(marks).length) out.push({ color: "transparent", label: "Long weekend", dash: true });
   out.push({ color: tint, label: "Today", round: true });
   return out;
 }
@@ -4525,10 +4546,11 @@ function CalLegend({ items }) {
     },
       o.default.createElement("span", {
         style: {
-          flexShrink: 0, background: it.color,
-          width: it.bar ? "14px" : "9px", height: it.bar ? "6px" : "9px",
+          flexShrink: 0, background: it.dash ? "transparent" : it.color,
+          width: it.dash ? "16px" : it.bar ? "14px" : "9px",
+          height: it.dash ? "0px" : it.bar ? "6px" : "9px",
           borderRadius: it.round ? "50%" : it.bar ? "3px" : "2.5px",
-          border: it.color === "transparent" ? "none" : "none"
+          borderTop: it.dash ? LW_DASH : "none"
         }
       }),
       o.default.createElement("span", {
@@ -4538,7 +4560,7 @@ function CalLegend({ items }) {
 }
 
 // ---- the calendar ----------------------------------------------------------
-function LifeCalendar({ tab, today, events, tints, onRange, onEvent, onAdd, addLabel, accent }) {
+function LifeCalendar({ tab, today, events, marks, onRange, onEvent, onAdd, addLabel, accent }) {
   useLocal(K_CALVIEW, "month");
   var view = readCalView();
   var aS = (0, o.useState)(function () { return new Date(today.getFullYear(), today.getMonth(), today.getDate()); });
@@ -4546,7 +4568,7 @@ function LifeCalendar({ tab, today, events, tints, onRange, onEvent, onAdd, addL
   var tint = accent || CAL_TINT[tab] || c.blue;
   var todayIso = isoOfDate(today);
   var evs = events || [];
-  var tn = tints || {};
+  var tn = marks || {};
 
   var go = function (dir) { setAnchor(calStep(view, anchor, dir)); };
   var setView = function (v) { writeCalView(v); };   // the day you were on is kept
@@ -4633,10 +4655,11 @@ function LifeCalendar({ tab, today, events, tints, onRange, onEvent, onAdd, addL
         return o.default.createElement("div", {
           key: cl.iso, role: "button", tabIndex: 0, onClick: function () { openDay(cl.iso); },
           style: {
-            minHeight: "104px", borderRadius: "9px", padding: "3px 2px", cursor: "pointer",
-            background: tn[cl.iso] || (cl.dow >= 5 ? "rgba(120,120,128,0.07)" : "transparent")
+            position: "relative", minHeight: "104px", borderRadius: "9px", padding: "3px 2px", cursor: "pointer",
+            background: cl.dow >= 5 ? "rgba(120,120,128,0.07)" : "transparent"
           }
         },
+          tn[cl.iso] ? o.default.createElement("div", { style: lwEdges(tn[cl.iso], cl.dow) }) : null,
           o.default.createElement("div", { style: { textAlign: "center", fontSize: "8.5px", fontWeight: "700", color: cl.dow >= 5 ? "#b26a00" : c.inkFaint, letterSpacing: "0.03em" } }, WEEK_HEAD[cl.dow].toUpperCase()),
           o.default.createElement("div", {
             style: {
@@ -4681,10 +4704,11 @@ function LifeCalendar({ tab, today, events, tints, onRange, onEvent, onAdd, addL
             onClick: function () { openDay(cl.iso); },
             style: {
               position: "relative", minHeight: "62px", borderRadius: "9px", cursor: "pointer",
-              background: tn[cl.iso] || (cl.dow >= 5 ? "rgba(120,120,128,0.07)" : "transparent"),
+              background: cl.dow >= 5 ? "rgba(120,120,128,0.07)" : "transparent",
               opacity: cl.inMonth ? 1 : .32, overflow: "hidden", padding: "0 2px 2px"
             }
           },
+            tn[cl.iso] ? o.default.createElement("div", { style: lwEdges(tn[cl.iso], cl.dow) }) : null,
             o.default.createElement("div", {
               style: {
                 margin: "3px auto 1px", width: "20px", height: "20px", borderRadius: "50%",
@@ -4750,7 +4774,9 @@ function LifeCalendar({ tab, today, events, tints, onRange, onEvent, onAdd, addL
                   aspectRatio: "1", borderRadius: "3px", display: "flex", alignItems: "center", justifyContent: "center",
                   fontSize: "7.5px", fontWeight: isToday ? "800" : "500",
                   color: !cl.inMonth ? "transparent" : col ? "#fff" : isToday ? "#fff" : c.inkFaint,
-                  background: !cl.inMonth ? "transparent" : col ? col : isToday ? tint : (tn[cl.iso] || "transparent"),
+                  background: !cl.inMonth ? "transparent" : col ? col : isToday ? tint : "transparent",
+                  // a mini-month cell is too small to outline, so it gets a dotted underline
+                  borderBottom: cl.inMonth && tn[cl.iso] ? "1.5px dotted #c8860a" : "none",
                   opacity: col ? .92 : 1
                 }
               }, cl.inMonth ? cl.d.getDate() : "");
@@ -5519,7 +5545,7 @@ function TravelTab({ onAvatar, today }) {
     o.default.createElement(LifeCalendar, {
       tab: "travel", today: today,
       events: calEvents("travel", calWindow.from, calWindow.to, { today: today }),
-      tints: calTravelTints(calWindow.from, calWindow.to, today),
+      marks: calTravelMarks(calWindow.from, calWindow.to, today),
       onRange: setCalWindow,
       onAdd: function (iso) { setSheet({ editing: null, preset: { start: iso, end: iso } }); },
       addLabel: "＋ Trip on this day",
