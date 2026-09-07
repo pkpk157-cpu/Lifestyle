@@ -4221,7 +4221,7 @@ function nextTrip(trips, today) {
 }
 
 // ---- the year at a glance: one thin strip per month, trips drawn as bars ----
-function TravelYearStrip({ trips, year, today, onOpen }) {
+function TravelYearStrip({ trips, year, today, onOpen, onMonth, selMonth }) {
   var rows = tripsInYear(trips, year).filter(function (t) { return t.status !== "cancelled"; });
   var todayIso = isoDay(0, today);
   var lw = longWeekends(year, trips, today);
@@ -4248,9 +4248,14 @@ function TravelYearStrip({ trips, year, today, onOpen }) {
         return { t: t, from: from, to: to };
       }).filter(Boolean);
       var isThisMonth = today.getFullYear() === year && today.getMonth() === mo;
-      return o.default.createElement("div", { key: mo, style: { display: "flex", alignItems: "center", gap: "9px", marginBottom: mo === 11 ? 0 : "7px" } },
+      var sel = selMonth === mo;
+      return o.default.createElement("div", {
+        key: mo, role: "button", title: "Show " + Mo[mo],
+        onClick: function () { if (onMonth) onMonth(mo); },
+        style: { display: "flex", alignItems: "center", gap: "9px", marginBottom: mo === 11 ? 0 : "3px", padding: "2px 4px", margin: "0 -4px", borderRadius: "8px", cursor: onMonth ? "pointer" : "default", background: sel ? "rgba(10,132,255,0.10)" : "transparent" }
+      },
         o.default.createElement("span", {
-          style: { width: "26px", flexShrink: 0, fontSize: "9.5px", fontWeight: isThisMonth ? "800" : "600", color: isThisMonth ? c.blue : c.inkFaint }
+          style: { width: "26px", flexShrink: 0, fontSize: "9.5px", fontWeight: isThisMonth || sel ? "800" : "600", color: sel ? c.blue : isThisMonth ? c.blue : c.inkFaint }
         }, D1[mo]),
         o.default.createElement("div", { style: { flex: 1, position: "relative", height: "16px", background: c.bg, borderRadius: "5px", overflow: "hidden" } },
           lw.map(function (sp, li) {
@@ -4276,7 +4281,7 @@ function TravelYearStrip({ trips, year, today, onOpen }) {
             var done = mt.t.status === "done" || (mt.t.end && mt.t.end < todayIso);
             return o.default.createElement("button", {
               key: i, className: "p", title: mt.t.place,
-              onClick: function () { onOpen(mt.t); },
+              onClick: function (e) { e.stopPropagation(); onOpen(mt.t); },
               style: {
                 position: "absolute", top: "2px", bottom: "2px", border: "none", cursor: "pointer", padding: 0,
                 left: ((mt.from - 1) / dim * 100) + "%",
@@ -4288,6 +4293,148 @@ function TravelYearStrip({ trips, year, today, onOpen }) {
             });
           })));
     }));
+}
+
+// ---- the month, as a wall calendar ----------------------------------------
+// The year strip says when you are away; this says which days. Seven columns
+// Monday to Sunday, every date numbered, trips drawn as bands running across
+// the days they cover, holidays dotted, long weekends tinted gold.
+
+var WEEK_HEAD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+// 42 cells starting on the Monday on or before the 1st
+function monthCells(year, mo) {
+  var first = new Date(year, mo, 1);
+  var lead = (first.getDay() + 6) % 7;          // Monday = 0
+  var cells = [];
+  for (var i = 0; i < 42; i++) {
+    var d = new Date(year, mo, 1 - lead + i);
+    cells.push({ d: d, iso: isoOfDate(d), inMonth: d.getMonth() === mo, dow: (d.getDay() + 6) % 7 });
+  }
+  // a month never needs a sixth row of nothing
+  if (cells.slice(35).every(function (x) { return !x.inMonth; })) cells = cells.slice(0, 35);
+  return cells;
+}
+
+// Give overlapping trips separate lanes so two bands never sit on each other.
+function tripLanes(trips, cells) {
+  var lo = cells[0].iso, hi = cells[cells.length - 1].iso;
+  var rows = trips.filter(function (t) {
+    return t.start && t.end && t.status !== "cancelled" && t.start <= hi && t.end >= lo;
+  }).sort(function (a, b) { return String(a.start).localeCompare(String(b.start)) || tripDays(b) - tripDays(a); });
+  var lanes = [];                                  // lane -> last end iso
+  var out = [];
+  rows.forEach(function (t) {
+    var lane = 0;
+    while (lane < lanes.length && lanes[lane] >= t.start) lane++;
+    lanes[lane] = t.end;
+    if (lane < 2) out.push({ t: t, lane: lane }); // two lanes is all a cell can hold
+  });
+  return out;
+}
+
+function TravelMonthGrid({ trips, year, mo, today, onPrev, onNext, onDay, onOpen }) {
+  useLocal(K_HOLIDAYS, null);
+  var cells = monthCells(year, mo);
+  var todayIso = isoDay(0, today);
+  var hols = {};
+  effectiveHolidays(year).concat(mo === 0 ? effectiveHolidays(year - 1) : mo === 11 ? effectiveHolidays(year + 1) : [])
+    .forEach(function (h) { if (!hols[h.date] || hols[h.date].rh) hols[h.date] = h; });
+  var gold = {};
+  longWeekends(year, trips, today).forEach(function (sp) {
+    for (var d = new Date(sp.start + "T00:00:00"); isoOfDate(d) <= sp.end; d.setDate(d.getDate() + 1)) gold[isoOfDate(d)] = 1;
+  });
+  var lanes = tripLanes(trips, cells);
+  var monthHols = Object.keys(hols).filter(function (k) {
+    var d = new Date(k + "T00:00:00"); return d.getFullYear() === year && d.getMonth() === mo;
+  }).sort();
+
+  var navBtn = function (label, fn, title) {
+    return o.default.createElement("button", {
+      className: "p", onClick: fn, title: title,
+      style: { width: "30px", height: "30px", borderRadius: "50%", border: "none", background: c.bg, cursor: "pointer", color: c.inkMid, fontSize: "16px", fontFamily: "inherit", flexShrink: 0, lineHeight: 1 }
+    }, label);
+  };
+
+  return o.default.createElement("div", {
+    style: {
+      background: "rgba(255,255,255,0.55)", borderRadius: "18px", padding: "14px 10px 12px",
+      border: "0.5px solid rgba(255,255,255,0.6)", marginBottom: "12px",
+      boxShadow: "0 6px 24px rgba(31,38,135,0.05), inset 0 1px 0 rgba(255,255,255,0.5)",
+      backdropFilter: "blur(24px) saturate(1.8)", WebkitBackdropFilter: "blur(24px) saturate(1.8)"
+    }
+  },
+    o.default.createElement("div", { style: { display: "flex", alignItems: "center", gap: "8px", marginBottom: "10px", padding: "0 4px" } },
+      navBtn("‹", onPrev, "Previous month"),
+      o.default.createElement("div", { style: { flex: 1, textAlign: "center", fontSize: "15px", fontWeight: "700", color: c.ink } }, Mo[mo] + " " + year),
+      navBtn("›", onNext, "Next month")),
+
+    o.default.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", marginBottom: "4px" } },
+      WEEK_HEAD.map(function (w, i) {
+        return o.default.createElement("div", {
+          key: w, style: { textAlign: "center", fontSize: "9.5px", fontWeight: "700", letterSpacing: "0.04em", color: i >= 5 ? "#b26a00" : c.inkFaint, padding: "2px 0" }
+        }, w.toUpperCase());
+      })),
+
+    o.default.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: "2px" } },
+      cells.map(function cell(cl, ix) {
+        var h = hols[cl.iso];
+        var isToday = cl.iso === todayIso;
+        var wkend = cl.dow >= 5;
+        var bands = lanes.filter(function (L) { return L.t.start <= cl.iso && L.t.end >= cl.iso; });
+        return o.default.createElement("div", {
+          key: cl.iso, role: "button", tabIndex: 0,
+          title: h ? h.name + (h.rh ? " (RH)" : "") : undefined,
+          onClick: function () { onDay(cl.iso); },
+          onKeyDown: function (e) { if (e.key === "Enter") onDay(cl.iso); },
+          style: {
+            position: "relative", minHeight: "60px", borderRadius: "9px", cursor: "pointer",
+            background: gold[cl.iso] ? "rgba(255,159,10,0.16)" : wkend ? "rgba(120,120,128,0.07)" : "transparent",
+            opacity: cl.inMonth ? 1 : .32, overflow: "hidden"
+          }
+        },
+          o.default.createElement("span", {
+            style: {
+              position: "absolute", top: "4px", left: "4px", width: "20px", height: "20px", borderRadius: "50%",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: "11.5px", fontWeight: isToday ? "800" : "600",
+              color: isToday ? "#fff" : h && !h.rh ? "#c0392b" : c.ink,
+              background: isToday ? c.blue : "transparent"
+            }
+          }, cl.d.getDate()),
+          h ? o.default.createElement("span", {
+            style: {
+              position: "absolute", top: "10px", right: "6px", width: "6px", height: "6px", borderRadius: "50%",
+              background: h.rh ? "transparent" : "#c0392b", border: "1.5px solid " + (h.rh ? "#b26a00" : "#c0392b")
+            }
+          }) : null,
+          bands.map(function (L) {
+            var t = L.t;
+            var first = t.start === cl.iso || cl.dow === 0;   // start of trip, or of the week row
+            var last = t.end === cl.iso || cl.dow === 6;
+            var done = t.status === "done" || t.end < todayIso;
+            return o.default.createElement("button", {
+              key: t.id, className: "p", title: t.place,
+              onClick: function (e) { e.stopPropagation(); onOpen(t); },
+              style: {
+                position: "absolute", left: first ? "3px" : "-2px", right: last ? "3px" : "-2px",
+                bottom: (4 + L.lane * 15) + "px", height: "13px", border: "none", padding: "0 4px",
+                borderRadius: (first ? "6px" : "0") + " " + (last ? "6px 6px" : "0 0") + " " + (first ? "6px" : "0"),
+                background: tripColor(t), opacity: done ? .5 : t.status === "idea" ? .4 : .95,
+                color: "#fff", fontSize: "8.5px", fontWeight: "700", textAlign: "left", cursor: "pointer",
+                whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontFamily: "inherit", lineHeight: "13px"
+              }
+            }, first ? t.place : "");
+          }));
+      })),
+
+    monthHols.length ? o.default.createElement("div", { style: { marginTop: "10px", padding: "0 4px", display: "flex", flexWrap: "wrap", gap: "4px 12px" } },
+      monthHols.map(function (k) {
+        var h = hols[k], d = new Date(k + "T00:00:00");
+        return o.default.createElement("span", { key: k, style: { fontSize: "10.5px", color: c.inkFaint, whiteSpace: "nowrap" } },
+          o.default.createElement("span", { style: { fontWeight: "700", color: h.rh ? "#b26a00" : "#c0392b" } }, w1[d.getDay()].slice(0, 3) + " " + d.getDate()),
+          " " + h.name + (h.rh ? " · RH" : ""));
+      })) : null);
 }
 
 // ---- add / edit a trip -----------------------------------------------------
@@ -4392,7 +4539,14 @@ function TripSheet({ editing, preset, today, onClose }) {
 function TravelTab({ onAvatar, today }) {
   useLocal(K_TRIPS, []);
   var yS = (0, o.useState)(today.getFullYear()), year = yS[0], setYear = yS[1];
+  var gmS = (0, o.useState)(today.getMonth()), gm = gmS[0], setGm = gmS[1];
   var shS = (0, o.useState)(null), sheet = shS[0], setSheet = shS[1];
+  var stepMonth = function (dir) {
+    var m2 = gm + dir;
+    if (m2 < 0) { setYear(year - 1); setGm(11); }
+    else if (m2 > 11) { setYear(year + 1); setGm(0); }
+    else setGm(m2);
+  };
   var trips = readTrips();
   var stats = travelYearStats(trips, year);
   var todayIso = isoDay(0, today);
@@ -4508,7 +4662,17 @@ function TravelTab({ onAvatar, today }) {
         o.default.createElement("span", { style: { fontSize: "15px", fontWeight: "700", color: c.ink, minWidth: "48px", textAlign: "center" } }, year),
         o.default.createElement("button", { className: "p", onClick: function () { setYear(year + 1); }, style: { width: "28px", height: "28px", borderRadius: "50%", border: "none", background: "rgba(255,255,255,0.7)", cursor: "pointer", color: c.inkFaint, fontSize: "15px", fontFamily: "inherit" } }, "›"))),
 
-    o.default.createElement(TravelYearStrip, { trips: trips, year: year, today: today, onOpen: function (t) { setSheet({ editing: t }); } }),
+    o.default.createElement(TravelYearStrip, {
+      trips: trips, year: year, today: today, selMonth: gm,
+      onOpen: function (t) { setSheet({ editing: t }); },
+      onMonth: function (m2) { setGm(m2); }
+    }),
+    o.default.createElement(TravelMonthGrid, {
+      trips: trips, year: year, mo: gm, today: today,
+      onPrev: function () { stepMonth(-1); }, onNext: function () { stepMonth(1); },
+      onDay: function (iso) { setSheet({ editing: null, preset: { start: iso, end: iso } }); },
+      onOpen: function (t) { setSheet({ editing: t }); }
+    }),
 
     o.default.createElement(LongWeekendCard, {
       year: year, trips: trips, today: today,
