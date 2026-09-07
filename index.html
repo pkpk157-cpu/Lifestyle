@@ -4338,7 +4338,7 @@ function calTravelEvents(from, to, today) {
   for (var y = y0; y <= y1; y++) {
     effectiveHolidays(y).forEach(function (h) {
       if (h.date < from || h.date > to) return;
-      out.push({ id: "hol" + h.date + h.name, iso: h.date, title: h.name, color: h.rh ? "#b26a00" : "#c0392b", icon: h.rh ? "○" : "●", kind: "holiday", sub: h.rh ? "Restricted holiday" : "Holiday", dim: !!h.rh });
+      out.push({ id: "hol" + h.date + h.name, iso: h.date, title: h.name, color: h.rh ? "#b26a00" : "#c0392b", icon: h.rh ? "○" : "●", kind: "holiday", lk: h.rh ? "holidayRh" : "holiday", sub: h.rh ? "Restricted holiday" : "Holiday", dim: !!h.rh });
     });
   }
   return out;
@@ -4387,7 +4387,7 @@ function calPaymentsEvents(from, to, today) {
     while (d <= to && guard++ < 400) {
       if (d >= from) out.push({
         id: "bill" + b.id + d, iso: d, title: b.name, color: b.autopay ? "#8e8e93" : "#ff9500",
-        icon: b.autopay ? "🔁" : "💸", kind: "bill", sub: (b.amount ? fmtINR(b.amount) : "") + (b.autopay ? " · autopay" : " · due"), ref: b
+        icon: b.autopay ? "🔁" : "💸", kind: "bill", lk: b.autopay ? "billAuto" : "bill", sub: (b.amount ? fmtINR(b.amount) : "") + (b.autopay ? " · autopay" : " · due"), ref: b
       });
       if (!b.frequency || b.frequency === "once") break;
       d = py(d, b.frequency);
@@ -4425,7 +4425,7 @@ function calTrackerEvents(from, to, today, habits, checks) {
     if (!t.dueDate || t.dueDate < from || t.dueDate > to) return;
     out.push({
       id: "task" + t.id, iso: t.dueDate, title: t.text, color: t.done ? "#8e8e93" : t.important ? "#ff9500" : "#0a84ff",
-      icon: t.done ? "✓" : "☐", kind: "task", dim: !!t.done, sub: t.done ? "Done" : "Task due", ref: t
+      icon: t.done ? "✓" : "☐", kind: "task", lk: t.done ? "taskDone" : t.important ? "taskImp" : "task", dim: !!t.done, sub: t.done ? "Done" : "Task due", ref: t
     });
   });
   // one ring a day: how many of the day's habits were ticked
@@ -4462,6 +4462,79 @@ function calEvents(tab, from, to, ctx) {
       .concat(calPeopleEvents(from, to, today), calPaymentsEvents(from, to, today),
         calTrackerEvents(from, to, today, ctx.habits, ctx.checks));
   } catch (e) { return []; }
+}
+
+// ---- the legend -----------------------------------------------------------
+// Only ever lists what is actually on screen: a calendar with no anniversaries
+// on it should not carry a swatch explaining anniversaries.
+
+var CAL_LEGEND = {
+  travel: [
+    { kind: "holiday", color: "#c0392b", label: "Holiday" },
+    { kind: "holidayRh", color: "#b26a00", label: "Restricted (RH)" }
+  ],
+  people: [
+    { kind: "birthday", color: "#ff2d55", label: "Birthday" },
+    { kind: "anniversary", color: "#af52de", label: "Anniversary" },
+    { kind: "contact", color: "#34c759", label: "Caught up" }
+  ],
+  payments: [
+    { kind: "bill", color: "#ff9500", label: "Bill due" },
+    { kind: "billAuto", color: "#8e8e93", label: "Autopay" },
+    { kind: "cardbill", color: "#ff3b30", label: "Card statement" },
+    { kind: "spend", color: "#5856d6", label: "Spent" }
+  ],
+  tracker: [
+    { kind: "task", color: "#0a84ff", label: "Task due" },
+    { kind: "taskImp", color: "#ff9500", label: "Important" },
+    { kind: "taskDone", color: "#8e8e93", label: "Done" },
+    { kind: "habits", color: "#34c759", label: "Habits ticked" }
+  ]
+};
+CAL_LEGEND.today = CAL_LEGEND.travel.concat(CAL_LEGEND.people, CAL_LEGEND.payments, CAL_LEGEND.tracker);
+
+function calLegend(tab, events, tints, tint) {
+  var out = [], present = {};
+  (events || []).forEach(function (e) { present[e.lk || e.kind] = 1; });
+  // trips carry their own colour, so each one earns its own swatch
+  if (present.trip) {
+    var seen = {}, trips = [];
+    (events || []).forEach(function (e) {
+      if (e.kind !== "trip" || seen[e.title]) return;
+      seen[e.title] = 1; trips.push({ color: e.color, label: e.title, bar: true });
+    });
+    out = out.concat(trips.slice(0, 4));
+    if (trips.length > 4) out.push({ color: "transparent", label: "+" + (trips.length - 4) + " more", muted: true });
+  }
+  (CAL_LEGEND[tab] || []).forEach(function (it) { if (present[it.kind]) out.push(it); });
+  if (tints && Object.keys(tints).length) out.push({ color: "rgba(255,159,10,0.45)", label: "Long weekend", block: true });
+  out.push({ color: tint, label: "Today", round: true });
+  return out;
+}
+
+function CalLegend({ items }) {
+  if (!items || !items.length) return null;
+  return o.default.createElement("div", {
+    style: {
+      display: "flex", flexWrap: "wrap", gap: "5px 12px", alignItems: "center",
+      marginTop: "10px", paddingTop: "9px", borderTop: "0.5px solid " + c.borderLt
+    }
+  }, items.map(function (it, i) {
+    return o.default.createElement("span", {
+      key: i, style: { display: "inline-flex", alignItems: "center", gap: "5px", minWidth: 0 }
+    },
+      o.default.createElement("span", {
+        style: {
+          flexShrink: 0, background: it.color,
+          width: it.bar ? "14px" : "9px", height: it.bar ? "6px" : "9px",
+          borderRadius: it.round ? "50%" : it.bar ? "3px" : "2.5px",
+          border: it.color === "transparent" ? "none" : "none"
+        }
+      }),
+      o.default.createElement("span", {
+        style: { fontSize: "10px", fontWeight: "600", color: it.muted ? c.inkFaint : c.inkMid, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "120px" }
+      }, it.label));
+  }));
 }
 
 // ---- the calendar ----------------------------------------------------------
@@ -4708,7 +4781,8 @@ function LifeCalendar({ tab, today, events, tints, onRange, onEvent, onAdd, addL
         style: { border: "none", background: "transparent", color: tint, fontSize: "11.5px", fontWeight: "700", cursor: "pointer", padding: "6px 4px", minHeight: "30px", fontFamily: "inherit", flexShrink: 0 }
       }, "Today") : null,
       navBtn("›", function () { go(1); }, "Next")),
-    body);
+    body,
+    view === "day" ? null : o.default.createElement(CalLegend, { items: calLegend(tab, evs, tn, tint) }));
 }
 
 // ---- bookings: read a ticket, an email, an SMS ----------------------------
