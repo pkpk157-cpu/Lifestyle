@@ -2,6 +2,13 @@ plugins {
     id 'com.android.application'
 }
 
+// The release key lives outside the repo. CI decodes it from a secret and
+// points LIFESTYLE_KEYSTORE at the file; locally you can export the same four
+// variables. Without them the release build is unsigned and only the debug
+// build is installable — see android/README.md.
+def ksPath = System.getenv("LIFESTYLE_KEYSTORE")
+def hasKeystore = ksPath != null && !ksPath.isEmpty() && file(ksPath).exists()
+
 android {
     namespace 'com.lifestyle.app'
     compileSdk 34
@@ -10,13 +17,28 @@ android {
         applicationId "com.lifestyle.app"
         minSdk 24
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        // CI passes the run number so each build is an upgrade, not a reinstall.
+        versionCode (System.getenv("LIFESTYLE_VERSION_CODE") ?: "1").toInteger()
+        versionName System.getenv("LIFESTYLE_VERSION_NAME") ?: "1.0"
+    }
+
+    signingConfigs {
+        release {
+            if (hasKeystore) {
+                storeFile file(ksPath)
+                storePassword System.getenv("LIFESTYLE_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("LIFESTYLE_KEY_ALIAS") ?: "lifestyle"
+                keyPassword System.getenv("LIFESTYLE_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
+            if (hasKeystore) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 

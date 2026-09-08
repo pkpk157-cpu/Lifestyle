@@ -43,7 +43,45 @@ Two consequences follow from that:
   browser instead. Do not change the WebView to load a remote URL while the
   bridge is attached.
 
-## Build it
+## Build it in CI (the easy way)
+
+`.github/workflows/android.yml` builds the APK on every push to `main` that
+touches `index.html` or `android/`, and attaches it to a GitHub release. Open
+**Releases** on the phone, tap the `.apk`, done — no Android SDK anywhere.
+
+It works with no setup at all, but that first build is *debug-signed*: Android
+regenerates that key every run, and it refuses to install a build whose
+signature differs from the installed one. You would have to uninstall first,
+**and uninstalling wipes the WebView's localStorage — that is all your data.**
+
+So set up one stable key. Four repository secrets, under
+*Settings → Secrets and variables → Actions*:
+
+| Secret | Value |
+|---|---|
+| `ANDROID_KEYSTORE_BASE64` | the keystore file, base64 with no line breaks |
+| `ANDROID_KEYSTORE_PASSWORD` | its store password |
+| `ANDROID_KEY_ALIAS` | `lifestyle` |
+| `ANDROID_KEY_PASSWORD` | the key password (same as the store password is fine) |
+
+To make one:
+
+```bash
+keytool -genkeypair -v -keystore lifestyle.jks -alias lifestyle \
+  -keyalg RSA -keysize 4096 -validity 10000 \
+  -dname "CN=Lifestyle, OU=Personal, O=Lifestyle, C=IN"
+base64 -w0 lifestyle.jks          # paste into ANDROID_KEYSTORE_BASE64
+```
+
+Keep `lifestyle.jks` somewhere safe and out of the repo — `.gitignore` covers
+`*.jks`, but lose the file and you can never upgrade an installed build again.
+Also check *Settings → Actions → General → Workflow permissions* is set to
+**Read and write**, or the release step cannot publish.
+
+`versionCode` comes from the workflow run number, so each build installs over
+the last one as an upgrade and keeps your data.
+
+## Build it by hand
 
 You need Android Studio (or a command-line Android SDK) — this repo has no
 Gradle wrapper checked in, so use Android Studio's, or your own `gradle`.
@@ -73,7 +111,9 @@ just tap "Allow and scan my messages" in the app and answer the dialog.
 
 ## Updating after a web change
 
-The assets are a copy, so every time `index.html` changes:
+The assets are a copy, so the APK keeps running the old web app until they are
+re-synced. In CI that happens on its own — push to `main`, wait for the build,
+install the new release. By hand:
 
 ```bash
 cd android && ./sync-web.sh && ./gradlew assembleDebug
@@ -94,6 +134,7 @@ exception. This is a personal build; sideload it.
 | `app/src/main/AndroidManifest.xml` | Permissions — note what is *absent* |
 | `app/src/main/assets/web/` | Copy of the web app, written by `sync-web.sh` |
 | `sync-web.sh` | Copies the web app into assets |
+| `../.github/workflows/android.yml` | Builds and releases the APK |
 
 ## Known limits
 
