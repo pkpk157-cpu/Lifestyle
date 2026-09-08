@@ -18,17 +18,20 @@ android {
         minSdk 24
         targetSdk 34
         // CI passes the run number so each build is an upgrade, not a reinstall.
-        versionCode (System.getenv("LIFESTYLE_VERSION_CODE") ?: "1").toInteger()
-        versionName System.getenv("LIFESTYLE_VERSION_NAME") ?: "1.0"
+        // Call parentheses are not optional here: written as a command
+        // expression, Groovy reads `versionCode (x).toInteger()` as
+        // `versionCode(x).toInteger()` and blows up on the null return.
+        versionCode(Integer.parseInt(System.getenv("LIFESTYLE_VERSION_CODE") ?: "1"))
+        versionName(System.getenv("LIFESTYLE_VERSION_NAME") ?: "1.0")
     }
 
     signingConfigs {
         release {
             if (hasKeystore) {
-                storeFile file(ksPath)
-                storePassword System.getenv("LIFESTYLE_KEYSTORE_PASSWORD")
-                keyAlias System.getenv("LIFESTYLE_KEY_ALIAS") ?: "lifestyle"
-                keyPassword System.getenv("LIFESTYLE_KEY_PASSWORD")
+                storeFile(file(ksPath))
+                storePassword(System.getenv("LIFESTYLE_KEYSTORE_PASSWORD"))
+                keyAlias(System.getenv("LIFESTYLE_KEY_ALIAS") ?: "lifestyle")
+                keyPassword(System.getenv("LIFESTYLE_KEY_PASSWORD"))
             }
         }
     }
