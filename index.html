@@ -5247,9 +5247,12 @@ function calTravelEvents(from, to, today) {
     if (!t.start || t.status === "cancelled") return;
     var end = t.end || t.start;
     if (end < from || t.start > to) return;
+    var over = t.status === "done" || end < isoDay(0, today);
     out.push({
-      id: "trip" + t.id, iso: t.start, endIso: end, title: t.place, color: tripColor(t),
-      icon: tripKind(t).icon, kind: "trip", dim: t.status === "idea" || t.status === "done",
+      id: "trip" + t.id, iso: t.start, endIso: end, title: t.place,
+      color: over ? TRIP_CAL_DONE : TRIP_CAL_PLANNED,
+      icon: tripKind(t).icon, kind: "trip", lk: over ? "tripDone" : "tripPlanned",
+      dim: t.status === "idea",
       sub: (t.bookings && t.bookings.length ? t.bookings.length + " booking" + (t.bookings.length === 1 ? "" : "s") : tripStatus(t).label), ref: t
     });
   });
@@ -5257,7 +5260,7 @@ function calTravelEvents(from, to, today) {
   for (var y = y0; y <= y1; y++) {
     effectiveHolidays(y).forEach(function (h) {
       if (h.date < from || h.date > to) return;
-      out.push({ id: "hol" + h.date + h.name, iso: h.date, title: h.name, color: h.rh ? "#b26a00" : "#c0392b", icon: h.rh ? "○" : "●", kind: "holiday", lk: h.rh ? "holidayRh" : "holiday", sub: h.rh ? "Restricted holiday" : "Holiday", dim: !!h.rh });
+      out.push({ id: "hol" + h.date + h.name, iso: h.date, title: h.name, color: holCal(h.rh), icon: h.rh ? "○" : "●", kind: "holiday", lk: h.rh ? "holidayRh" : "holiday", sub: h.rh ? "Restricted holiday" : "Holiday" });
     });
   }
   return out;
@@ -5408,10 +5411,34 @@ function calEvents(tab, from, to, ctx) {
 // Only ever lists what is actually on screen: a calendar with no anniversaries
 // on it should not carry a swatch explaining anniversaries.
 
+// The calendar reads by state rather than by trip: light green while a trip
+// is still ahead of you, dark once it has happened. Holidays are the two greys
+// so nothing on the grid competes with the travel itself.
+var TRIP_CAL_PLANNED = "#9ad9ae";
+var TRIP_CAL_DONE = "#177a3c";
+// A full holiday should always read louder than a restricted one. On a light
+// page that means dark grey against light; on a dark page the relationship
+// only survives if it flips, so it does.
+function holCal(rh) {
+  var dark = false;
+  try { dark = isDarkNow(); } catch (e) {}
+  return rh ? (dark ? "#5c5c62" : "#c8c8ce") : (dark ? "#d6d6db" : "#48484a");
+}
+
+// Whether text on a filled swatch should be white or dark.
+function calOnColor(hex) {
+  var h = String(hex || "").replace("#", "");
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  if (h.length !== 6) return "#fff";
+  var r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
+  if (isNaN(r) || isNaN(g) || isNaN(b)) return "#fff";
+  return (r * 299 + g * 587 + b * 114) / 1000 > 150 ? "#1c1c1e" : "#fff";
+}
+
 var CAL_LEGEND = {
   travel: [
-    { kind: "holiday", color: "#c0392b", label: "Holiday" },
-    { kind: "holidayRh", color: "#b26a00", label: "Restricted (RH)" }
+    { kind: "holiday", label: "Holiday" },
+    { kind: "holidayRh", label: "Restricted (RH)" }
   ],
   people: [
     { kind: "birthday", color: "#ff2d55", label: "Birthday" },
@@ -5436,17 +5463,14 @@ CAL_LEGEND.today = CAL_LEGEND.travel.concat(CAL_LEGEND.people, CAL_LEGEND.paymen
 function calLegend(tab, events, marks, tint) {
   var out = [], present = {};
   (events || []).forEach(function (e) { present[e.lk || e.kind] = 1; });
-  // trips carry their own colour, so each one earns its own swatch
-  if (present.trip) {
-    var seen = {}, trips = [];
-    (events || []).forEach(function (e) {
-      if (e.kind !== "trip" || seen[e.title]) return;
-      seen[e.title] = 1; trips.push({ color: e.color, label: e.title, bar: true });
-    });
-    out = out.concat(trips.slice(0, 4));
-    if (trips.length > 4) out.push({ color: "transparent", label: "+" + (trips.length - 4) + " more", muted: true });
-  }
-  (CAL_LEGEND[tab] || []).forEach(function (it) { if (present[it.kind]) out.push(it); });
+  // every trip shares one pair of swatches rather than earning its own
+  if (present.tripPlanned) out.push({ color: TRIP_CAL_PLANNED, label: "Planned", bar: true });
+  if (present.tripDone) out.push({ color: TRIP_CAL_DONE, label: "Done", bar: true });
+  (CAL_LEGEND[tab] || []).forEach(function (it) {
+    if (!present[it.kind]) return;
+    out.push(it.kind === "holiday" || it.kind === "holidayRh"
+      ? ot(P({}, it), { color: holCal(it.kind === "holidayRh") }) : it);
+  });
   if (marks && Object.keys(marks).length) out.push({ color: "transparent", label: "Long weekend", dash: true });
   out.push({ color: tint, label: "Today", round: true });
   return out;
@@ -5521,7 +5545,7 @@ function LifeCalendar({ tab, today, events, marks, onRange, onEvent, onAdd, addL
       onClick: function (ev) { ev.stopPropagation(); if (onEvent) onEvent(e); },
       style: ot(P({
         display: "block", width: "100%", textAlign: "left", border: "none", cursor: "pointer",
-        background: e.color, color: "#fff", opacity: e.dim ? .5 : .95,
+        background: e.color, color: calOnColor(e.color), opacity: e.dim ? .5 : .95,
         borderRadius: "4px", padding: "0 3px", fontSize: "8.5px", fontWeight: "700", lineHeight: "13px",
         height: "13px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
         fontFamily: "inherit", marginTop: "2px"
@@ -5647,7 +5671,7 @@ function LifeCalendar({ tab, today, events, marks, onRange, onEvent, onAdd, addL
                   position: "absolute", left: first ? "3px" : "-2px", right: last ? "3px" : "-2px",
                   top: (25 + ln * 15) + "px", height: "13px", border: "none", padding: "0 4px",
                   borderRadius: (first ? "6px" : "0") + " " + (last ? "6px 6px" : "0 0") + " " + (first ? "6px" : "0"),
-                  background: e.color, opacity: e.dim ? .5 : .95, color: "#fff", fontSize: "8.5px",
+                  background: e.color, opacity: e.dim ? .5 : .95, color: calOnColor(e.color), fontSize: "8.5px",
                   fontWeight: "700", textAlign: "left", cursor: "pointer", whiteSpace: "nowrap",
                   overflow: "hidden", textOverflow: "ellipsis", fontFamily: "inherit", lineHeight: "13px"
                 }
@@ -5687,13 +5711,17 @@ function LifeCalendar({ tab, today, events, marks, onRange, onEvent, onAdd, addL
             cells.map(function (cl) {
               var col = cl.inMonth ? byDay[cl.iso] : null;
               var isToday = cl.iso === todayIso;
+              // Saturday and Sunday sit on a grey so the weekend shape of the
+              // year is visible at a glance, the same as the month grid
+              var wknd = cl.inMonth && cl.dow >= 5;
               return o.default.createElement("div", {
                 key: cl.iso,
                 style: {
                   aspectRatio: "1", borderRadius: "3px", display: "flex", alignItems: "center", justifyContent: "center",
                   fontSize: "7.5px", fontWeight: isToday ? "800" : "500",
-                  color: !cl.inMonth ? "transparent" : col ? "#fff" : isToday ? "#fff" : c.inkFaint,
-                  background: !cl.inMonth ? "transparent" : col ? col : isToday ? tint : "transparent",
+                  color: !cl.inMonth ? "transparent" : col ? calOnColor(col) : isToday ? "#fff" : c.inkFaint,
+                  background: !cl.inMonth ? "transparent" : col ? col : isToday ? tint : wknd ? "rgba(120,120,128,0.15)" : "transparent",
+                  boxShadow: wknd && !col && !isToday ? "inset 0 0 0 0.5px rgba(120,120,128,0.18)" : "none",
                   // a mini-month cell is too small to outline, so it gets a dotted underline
                   borderBottom: cl.inMonth && tn[cl.iso] ? "1.5px dotted #c8860a" : "none",
                   opacity: col ? .92 : 1
@@ -6493,11 +6521,6 @@ function TravelTab({ onAvatar, today }) {
           }, "✕"));
       })
     ]) : null,
-
-    o.default.createElement("button", {
-      className: "p", onClick: function () { setSheet({ editing: null, importText: " " }); },
-      style: { width: "100%", minHeight: "44px", borderRadius: "14px", border: "1px dashed " + c.border, background: "transparent", color: c.blue, fontSize: "13px", fontWeight: "600", cursor: "pointer", fontFamily: "inherit", marginBottom: "12px" }
-    }, "📥 Add a trip from a ticket or booking email"),
 
     o.default.createElement(LongWeekendCard, {
       year: year, trips: trips, today: today,
