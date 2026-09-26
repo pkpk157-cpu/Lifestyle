@@ -1484,8 +1484,13 @@ function panHolder(s) {
 }
 function ifscOk(s) { return /^[A-Z]{4}0[A-Z0-9]{6}$/.test(String(s || "").toUpperCase().replace(/\s/g, "")); }
 function epicOk(s) { return /^[A-Z]{3}[0-9]{7}$/.test(String(s || "").toUpperCase().replace(/\s/g, "")); }
+// Eight characters: one or two letters, then digits. The older series is a
+// letter and seven digits, the newer one two letters and six — and real ones
+// use Z and X and end in 0, so the tighter rule that is often quoted for these
+// is wrong and would call a perfectly good passport a typo.
 function passportOk(s) {
-  return /^[A-PR-WY][1-9][0-9]\s?[0-9]{4}[1-9]$/.test(String(s || "").toUpperCase().replace(/\s/g, ""));
+  var t = String(s || "").toUpperCase().replace(/[\s-]/g, "");
+  return /^[A-Z][0-9]{7}$/.test(t) || /^[A-Z]{2}[0-9]{6}$/.test(t);
 }
 // Ordinary plates (KA 01 AB 1234) and the Bharat series (22 BH 1234 AA).
 function vehicleOk(s) {
@@ -1843,10 +1848,12 @@ function idDocNumber(doc) {
   var t = idType(doc && doc.type);
   var raw = ((doc && doc.fields) || {})[t.primary] || "";
   if (!raw) {
-    // fall back to the first field that has anything in it
+    // Fall back to another field, but only one that actually looks like a
+    // reference — falling back to a name gives rows like "•••• hani", which
+    // says nothing and hides that the number is simply missing.
     for (var i = 0; i < t.fields.length; i++) {
       var v = ((doc && doc.fields) || {})[t.fields[i].k];
-      if (v) { raw = v; break; }
+      if (v && /\d/.test(String(v)) && t.fields[i].kind !== "date") { raw = v; break; }
     }
   }
   if (!raw) return "";
